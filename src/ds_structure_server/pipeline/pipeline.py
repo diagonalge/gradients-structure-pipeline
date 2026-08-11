@@ -1,0 +1,2405 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import random
+import re
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Callable
+
+from .inference import InferenceBackend
+from ds_structure_server.job_runtime import StructureJobCancelled
+from .models import (
+    CHUNK_LEVELS,
+    ChunkLevel,
+    DatasetProfile,
+    DocumentTree,
+    GeneratedPair,
+    Persona,
+    SampledChunk,
+    SourceDocument,
+)
+from .parsing import parse_document, split_sentences
+from .references import (
+    extract_reference_mentions,
+    format_output_with_reference_context,
+    resolve_reference_excerpts,
+)
+
+BUILTIN_PERSONAS = (
+    Persona(
+        name="line-analyst",
+        description="A careful reader who extracts and clarifies atomic facts from short source spans.",
+        chunk_level="line",
+        question_style="Ask a precise standalone question answerable from the local span.",
+    ),
+    Persona(
+        name="summarizer",
+        description="A reader who needs an accurate high-level understanding of a document or major section.",
+        chunk_level="section",
+        question_style="Ask for a concise synthesis of the central facts, reasoning, or outcome.",
+    ),
+    Persona(
+        name="needle",
+        description="A reader looking for one precise fact hidden among surrounding information.",
+        chunk_level="needle",
+        question_style="Ask a specific, independently understandable question about the target fact.",
+    ),
+    Persona(
+        name="detail-researcher",
+        description="A domain reader checking concrete details and relationships in the source.",
+        chunk_level="paragraph",
+        question_style="Ask a standalone factual or explanatory question answered directly by the passage.",
+    ),
+)
+
+GENERIC_PERSONA_NAMES = ("line-analyst", "summarizer", "needle", "detail-researcher")
+
+_DEDUP_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "of",
+        "to",
+        "for",
+        "in",
+        "on",
+        "at",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "what",
+        "which",
+        "who",
+        "how",
+        "when",
+        "where",
+        "why",
+        "tell",
+        "me",
+        "give",
+        "help",
+        "please",
+        "with",
+        "from",
+        "into",
+        "about",
+        "that",
+        "this",
+        "these",
+        "those",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "should",
+        "would",
+        "a",
+    }
+)
+
+_LOW_VALUE_CHUNK_RE = re.compile(
+    r"(?is)\b(?:"
+    r"(?:from|in|see|cf\.?)\s+(?:the\s+)?(?:next|previous|following|preceding|earlier|later)\s+"
+    r"(?:chapter|section|page|paragraph|exercise)|"
+    r"as\s+we\s+(?:shall|will)\s+see|"
+    r"later\s+(?:on\s+)?(?:in\s+)?(?:this|the)\s+(?:chapter|section|book)|"
+    r"in\s+the\s+(?:next|previous|following)\s+(?:chapter|section)|"
+    r"discussed\s+(?:in|below|above|later)|"
+    r"see\s+(?:chapter|section|page)\s+\d|"
+    r"to\s+be\s+(?:defined|proved|shown|discussed)\s+(?:later|below|in\s+chapter)"
+    r")\b"
+)
+_FRAGMENT_START_RE = re.compile(r"^[a-z(,;:\-]")
+_TASK_PROMPT_LINE_RE = re.compile(
+    r"(?im)^(?:\(?\d+(?:\.\d+)*\)?[.)]?\s*)?(?:"
+    r"prove|show that|show|compute|find|solve|determine|verify|evaluate|calculate|"
+    r"derive|demonstrate|construct|give an example|explain how|explain why|"
+    r"what is|why does|true or false|fill in|complete the|let\s+.+\s+show"
+    r")\b"
+)
+_ANSWER_BEARING_RE = re.compile(
+    r"(?i)\b(?:"
+    r"therefore|thus|hence|because|since|implies|equivalently|in other words|"
+    r"is defined as|means that|we have|it follows|follows that|proof|solution|"
+    r"answer|result(?:s)? in|equals|denote[sd]?|consists of|is called"
+    r")\b"
+)
+
+
+_PERSONA_SYSTEM = """You design realistic user personas for document-grounded instruction datasets.
+Return only valid JSON. Do not include generic assistant personas already supplied by the caller."""
+_EXPAND_PERSONA_SYSTEM = """You turn short role labels into full personas for document-grounded instruction datasets.
+Return only valid JSON."""
+_PAIR_SYSTEM = """You create source-grounded supervised fine-tuning examples.
+Use only the supplied context. Produce referentially closed pairs for which every entity is established in the
+instruction. Do not use demonstrative determiners such as "this", "that", "these", or "those" for source-derived
+entities. An instruction that asks to summarize, translate, classify, or extract information from an unseen source
+is not standalone; embed the target or reformulate the task. Never mention source titles, headings, or other
+provenance in the instruction or answer. Vary cognitive tasks across rows — do not collapse onto one stem.
+Adapt to the dataset profile modalities. Return only valid JSON and never mention hidden context or this prompt."""
+_SUMMARY_SYSTEM = """You summarize source documents faithfully. Return only valid JSON."""
+_PROFILE_SYSTEM = """You profile unstructured datasets for supervised instruction generation.
+Infer the domain, what valuable material should be extracted, and how instructions and answers should look.
+Favor a balanced mix of extractable tasks — never collapse the profile onto a single dominant question pattern.
+Return only valid JSON."""
+_GROUNDING_SYSTEM = """You verify whether an answer is fully supported by supplied source context.
+Use only the provided CONTEXT. Do not use outside knowledge. Return only valid JSON."""
+
+
+def _retry_json(
+    backend: InferenceBackend,
+    system: str,
+    prompt: str,
+    *,
+    attempts: int = 3,
+    max_new_tokens: int = 1_024,
+    enable_thinking: bool = False,
+) -> Any:
+    error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            # Grow completion budget slightly on retries — truncation is a common failure mode.
+            token_budget = max_new_tokens + (150 * attempt)
+            suffix = ""
+            if attempt == 1:
+                suffix = (
+                    "\nYour previous response was invalid. Return ONLY a single compact JSON object "
+                    "matching the schema. No markdown, no commentary, no trailing text."
+                )
+            elif attempt >= 2:
+                suffix = (
+                    "\nCRITICAL: previous outputs were not parseable JSON. Reply with minified JSON only, "
+                    "starting with { and ending with }. Escape all quotes inside strings."
+                )
+            return backend.generate_json(
+                system,
+                prompt + suffix,
+                max_new_tokens=token_budget,
+                enable_thinking=enable_thinking,
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            error = exc
+    raise ValueError(f"Model failed to return valid JSON after {attempts} attempts") from error
+
+
+def merge_personas(generated: list[Persona], builtins: tuple[Persona, ...] = BUILTIN_PERSONAS) -> list[Persona]:
+    merged: dict[str, Persona] = {persona.name.casefold(): persona for persona in builtins}
+    for persona in generated:
+        merged.setdefault(persona.name.casefold(), persona)
+    return list(merged.values())
+
+
+def builtin_persona_by_name(name: str) -> Persona | None:
+    key = name.strip().casefold()
+    aliases = {
+        "needle-in-haystack": "needle",
+        "needle_in_haystack": "needle",
+        "needle-in-the-haystack": "needle",
+        "line_analyst": "line-analyst",
+        "lineanalyst": "line-analyst",
+    }
+    key = aliases.get(key, key)
+    for persona in BUILTIN_PERSONAS:
+        if persona.name.casefold() == key:
+            return persona
+    return None
+
+
+def generic_builtin_personas() -> list[Persona]:
+    return [persona for persona in BUILTIN_PERSONAS if persona.name in GENERIC_PERSONA_NAMES]
+
+
+def normalize_instruction_for_dedup(text: str) -> str:
+    value = re.sub(r"\s+", " ", (text or "").strip().casefold())
+    value = value.strip(" ?.!,;:\"'")
+    return value
+
+
+def instruction_exact_key(text: str) -> str:
+    return hashlib.sha1(normalize_instruction_for_dedup(text).encode("utf-8")).hexdigest()
+
+
+def instruction_near_fingerprint(text: str, *, max_tokens: int = 12) -> str:
+    normalized = normalize_instruction_for_dedup(text)
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9'-]*", normalized)
+        if token not in _DEDUP_STOPWORDS and len(token) > 1
+    ]
+    unique = sorted(set(tokens))[:max_tokens]
+    payload = " ".join(unique)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+_CONTEXT_BOUND_INSTRUCTION_RE = re.compile(
+    r"(?:"
+    r"\baccording to\b|"
+    r"\bas (?:described|outlined|stated|noted|mentioned|discussed|presented) in\b|"
+    r"\bbased on (?:the )?(?:textbook|section|passage|chapter|document|source|text|excerpt|material)\b|"
+    r"\b(?:the |this |that )?(?:textbook|passage|excerpt|chapter|document|source material)\b|"
+    r"\b(?:in|from|per) the (?:textbook|section|passage|chapter|document|source)\b|"
+    r"\b(?:textbook|section|chapter) (?:title|heading)\b|"
+    r"\bprovided (?:textbook|section|passage|chapter|document|text|excerpt)\b|"
+    r"\bthe (?:above|following|given|supplied|attached) (?:text|passage|section|excerpt|document)\b|"
+    r"\brefer(?:ring)? to the (?:text|passage|section|textbook|document|source)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def instruction_cites_source_context(text: str) -> bool:
+    """True when the instruction depends on unseen source provenance or scaffolding."""
+    value = (text or "").strip()
+    if not value:
+        return True
+    if _CONTEXT_BOUND_INSTRUCTION_RE.search(value):
+        return True
+    # Title/heading leaks often appear wrapped in asterisks.
+    if re.search(r"\*[^*]{3,80}\*", value):
+        return True
+    return False
+
+
+def instruction_stem_key(text: str, *, max_tokens: int = 5) -> str:
+    """Coarse opening-stem key used to cap repeated instruction templates."""
+    normalized = normalize_instruction_for_dedup(text)
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9'-]*", normalized)
+        if token not in _DEDUP_STOPWORDS and len(token) > 1
+    ]
+    if not tokens:
+        return normalized[:48]
+    # Collapse "list/state ... criteria ..." openers onto one family key.
+    if tokens[0] in {"list", "state", "give", "outline"} and "criteria" in tokens[:6]:
+        return "list criteria"
+    if "criteria" in tokens[:5] and any(tok in tokens[:5] for tok in ("diagnostic", "diagnosis", "essentials")):
+        return "list criteria"
+    return " ".join(tokens[:max_tokens])
+
+
+class InstructionDeduper:
+    """Job-wide exact + near-dup + stem-diversity + context-bound gate.
+
+    Exact/near hashes live in a job-local dbm file so RAM does not grow with
+    every accepted row. Stem counts stay a small in-memory dict.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_stem_share: float = 0.22,
+        min_before_stem_cap: int = 6,
+        store_path: Path | None = None,
+    ) -> None:
+        import dbm
+
+        self._lock = threading.Lock()
+        self._stems: dict[str, int] = defaultdict(int)
+        self._accepted = 0
+        self._max_stem_share = max(0.05, min(1.0, max_stem_share))
+        self._min_before_stem_cap = max(1, min_before_stem_cap)
+        self._store_path = Path(store_path) if store_path else None
+        self._db = None
+        if self._store_path is not None:
+            self._store_path.parent.mkdir(parents=True, exist_ok=True)
+            self._db = dbm.open(str(self._store_path), "c")
+        else:
+            self._exact: set[str] = set()
+            self._near: set[str] = set()
+
+    def close(self) -> None:
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None
+
+    def _has(self, kind: bytes, digest: str) -> bool:
+        key = kind + digest.encode("ascii")
+        if self._db is not None:
+            return key in self._db
+        bucket = self._exact if kind == b"e:" else self._near
+        return digest in bucket
+
+    def _put(self, kind: bytes, digest: str) -> None:
+        key = kind + digest.encode("ascii")
+        if self._db is not None:
+            self._db[key] = b"1"
+            return
+        bucket = self._exact if kind == b"e:" else self._near
+        bucket.add(digest)
+
+    def try_claim(self, instruction: str) -> bool:
+        if instruction_cites_source_context(instruction):
+            return False
+        exact = instruction_exact_key(instruction)
+        near = instruction_near_fingerprint(instruction)
+        stem = instruction_stem_key(instruction)
+        with self._lock:
+            if self._has(b"e:", exact) or self._has(b"n:", near):
+                return False
+            if self._accepted >= self._min_before_stem_cap:
+                projected = self._stems[stem] + 1
+                share = projected / (self._accepted + 1)
+                if self._stems[stem] >= 2 and share > self._max_stem_share:
+                    return False
+            self._put(b"e:", exact)
+            self._put(b"n:", near)
+            self._stems[stem] += 1
+            self._accepted += 1
+            return True
+
+
+# Canonical cognitive task focuses (fallbacks when profile is thin).
+DEFAULT_TASK_FOCUSES = (
+    "define_or_clarify_term",  # knowledge recall
+    "explain_mechanism_or_reasoning",  # explanation
+    "transform_summarize_or_structure",  # transformation
+    "compare_or_differentiate",  # comparison
+    "apply_rule_or_procedure",  # application
+    "infer_what_follows",  # reasoning
+    "critique_or_verify_claim",  # critique
+    "decide_when_to_use",  # decision
+)
+
+def expand_persona_stubs(
+    backend: InferenceBackend,
+    names: list[str],
+    documents: list[SourceDocument],
+    *,
+    dataset_profile: DatasetProfile | None = None,
+) -> list[Persona]:
+    """Turn short role labels (e.g. 'doctor') into full Persona objects using the source profile."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = re.sub(r"[^a-z0-9]+", "-", raw.strip().casefold()).strip("-")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+    if not cleaned:
+        return []
+    if not documents:
+        raise ValueError("At least one document is required to expand persona stubs")
+
+    profile_block = (
+        f"Dataset profile to respect:\n{dataset_profile.prompt_block()}\n"
+        if dataset_profile is not None
+        else "No dataset profile was supplied; infer persona details from the samples alone.\n"
+    )
+    prompt = f"""Expand each role label into one concrete persona for this dataset.
+{profile_block}
+Rules:
+- Keep the persona name as a short kebab-case slug derived from the label.
+- description: who they are and what they need from a single source row.
+- chunk_level: one of document|section|paragraph|line|needle|page.
+- question_style: abstract instruction behavior covering MULTIPLE task shapes (not one fixed request stem).
+  It must be adaptable across rows.
+- Do not specialize the persona so every row becomes the same request template.
+- Tasks must be answerable from one row without aggregating across rows.
+- Prefer the dataset profile's extractable assets and preferred task types.
+
+Return only:
+{{"personas": [
+  {{"name": "short-kebab-name", "description": "broad role and goal",
+    "chunk_level": "document|section|paragraph|line|needle|page", "question_style": "adaptable instruction behavior"}}
+]}}
+
+Role labels to expand:
+{json.dumps(cleaned, ensure_ascii=False)}
+
+Sample rows:
+{json.dumps(_persona_excerpts(documents[:8]), ensure_ascii=False)}
+"""
+    value = _retry_json(backend, _EXPAND_PERSONA_SYSTEM, prompt, max_new_tokens=900)
+    expanded = _parse_personas(value, limit=len(cleaned))
+    by_name = {persona.name.casefold(): persona for persona in expanded}
+    ordered: list[Persona] = []
+    for label in cleaned:
+        persona = by_name.get(label)
+        if persona is None:
+            # Fall back to first unused expanded persona, or synthesize a minimal one.
+            for candidate in expanded:
+                if candidate.name.casefold() not in {item.name.casefold() for item in ordered}:
+                    persona = candidate
+                    break
+        if persona is None:
+            persona = Persona(
+                name=label,
+                description=f"A {label.replace('-', ' ')} using information from one source document.",
+                chunk_level="paragraph",
+                question_style=f"Ask a standalone question a {label.replace('-', ' ')} would need answered.",
+            )
+        ordered.append(persona)
+    return ordered
+
+
+def resolve_personas(
+    backend: InferenceBackend,
+    documents: list[SourceDocument],
+    *,
+    presets: list[str] | None = None,
+    names: list[str] | None = None,
+    max_personas: int = 1,
+    infer: bool | None = None,
+    dataset_profile: DatasetProfile | None = None,
+) -> list[Persona]:
+    """Combine preset builtins, custom name stubs, and optional inferred personas up to max_personas.
+
+    Priority: presets, then expanded custom names, then inferred fill for remaining slots.
+    `infer` defaults to True when presets+names leave unused slots under max_personas.
+    """
+    if max_personas < 1:
+        raise ValueError("max_personas must be at least 1")
+    preset_names = presets if presets is not None else ["summarizer"]
+    custom_names = names or []
+
+    seeded: list[Persona] = []
+    seen: set[str] = set()
+    for raw in preset_names:
+        persona = builtin_persona_by_name(raw)
+        if persona is None:
+            raise ValueError(f"Unknown persona preset: {raw!r}")
+        key = persona.name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        seeded.append(persona)
+        if len(seeded) >= max_personas:
+            return seeded
+
+    remaining_names = [name for name in custom_names if re.sub(r"[^a-z0-9]+", "-", name.strip().casefold()).strip("-") not in seen]
+    if remaining_names and len(seeded) < max_personas:
+        expanded = expand_persona_stubs(backend, remaining_names, documents, dataset_profile=dataset_profile)
+        for persona in expanded:
+            key = persona.name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            seeded.append(persona)
+            if len(seeded) >= max_personas:
+                return seeded
+
+    slots_left = max_personas - len(seeded)
+    should_infer = infer if infer is not None else slots_left > 0
+    if should_infer and slots_left > 0:
+        inferred = infer_personas(
+            backend,
+            documents,
+            maximum=slots_left,
+            include_builtins=False,
+            dataset_profile=dataset_profile,
+        )
+        for persona in inferred:
+            key = persona.name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            seeded.append(persona)
+            if len(seeded) >= max_personas:
+                break
+    if not seeded:
+        summarizer = builtin_persona_by_name("summarizer")
+        assert summarizer is not None
+        seeded = [summarizer]
+    return seeded[:max_personas]
+
+
+def _parse_personas(value: Any, limit: int) -> list[Persona]:
+    raw_personas = value.get("personas", []) if isinstance(value, dict) else []
+    if not isinstance(raw_personas, list):
+        raise ValueError("Persona response must contain a personas list")
+    generated_by_name: dict[str, Persona] = {}
+    for item in raw_personas:
+        if isinstance(item, dict):
+            persona = Persona.from_dict(item)
+            generated_by_name.setdefault(persona.name.casefold(), persona)
+        if len(generated_by_name) >= limit:
+            break
+    return list(generated_by_name.values())
+
+
+def _persona_excerpts(documents: list[SourceDocument], max_chars: int = 700) -> list[dict[str, str]]:
+    return [
+        {
+            "title": document.title,
+            "excerpt": re.sub(r"\s+", " ", document.text).strip()[:max_chars],
+        }
+        for document in documents
+    ]
+
+
+def _brief_skim_excerpts(
+    documents: list[SourceDocument],
+    *,
+    max_docs: int = 1,
+    max_chars: int = 1_200,
+) -> list[dict[str, str]]:
+    """Head / middle / tail skim so suggest only briefly reviews the source."""
+    out: list[dict[str, str]] = []
+    for document in documents[: max(1, max_docs)]:
+        text = re.sub(r"\s+", " ", (document.text or "")).strip()
+        if not text:
+            continue
+        if len(text) <= max_chars:
+            excerpt = text
+        else:
+            third = max(120, max_chars // 3)
+            mid = max(0, (len(text) // 2) - (third // 2))
+            excerpt = f"{text[:third]} … {text[mid : mid + third]} … {text[-third:]}"
+        out.append({"title": document.title, "excerpt": excerpt})
+    return out
+
+
+def infer_profile_and_extra_personas_fast(
+    backend: InferenceBackend,
+    documents: list[SourceDocument],
+    *,
+    max_inferred: int = 2,
+) -> tuple[DatasetProfile, list[Persona]]:
+    """One brief-skim LLM call: dataset profile + up to ``max_inferred`` DS personas."""
+    if not documents:
+        raise ValueError("At least one document is required")
+    skim = _brief_skim_excerpts(documents, max_docs=1, max_chars=1_200)
+    if not skim:
+        raise ValueError("Document skim is empty")
+    prompt = f"""Briefly skim the source excerpts (head/middle/tail only) and return:
+1) a compact dataset profile
+2) exactly {max_inferred} domain-specific personas
+
+Do NOT include line-analyst, summarizer, needle, or detail-researcher — those are already added.
+Keep preferred_task_types to 4 short abstract labels (diverse cognitive moves).
+Persona description and question_style: one short sentence each.
+Prefer chunk_level paragraph or section unless line is clearly better.
+
+Return only JSON:
+{{
+  "domain": "short domain label",
+  "source_kind": "textbook|case_law|clinical_notes|code|research_paper|news|other",
+  "content_signals": ["signal1", "signal2"],
+  "extractable_assets": ["asset1", "asset2"],
+  "preferred_task_types": ["task1", "task2", "task3", "task4"],
+  "instruction_guidance": "standalone named-subject rules; no example stems",
+  "answer_guidance": "concise factual answers across the task types",
+  "avoid": ["repeating the same task type or instruction stem across rows"],
+  "recommended_chunk_level": "document|section|paragraph|line|needle|page",
+  "personas": [
+    {{"name": "short-kebab-name", "description": "who they are and their goal",
+      "chunk_level": "document|section|paragraph|line|needle|page",
+      "question_style": "adaptable multi-shape instruction behavior"}}
+  ]
+}}
+
+Source skim:
+{json.dumps(skim, ensure_ascii=False)}
+"""
+    value = _retry_json(backend, _PROFILE_SYSTEM, prompt, max_new_tokens=900, attempts=3)
+    if not isinstance(value, dict):
+        raise ValueError("Fast suggest response must be a JSON object")
+    profile = _normalize_dataset_profile(DatasetProfile.from_dict(value))
+    personas = _parse_personas(value, max_inferred)
+    return profile, personas[:max_inferred]
+
+
+def infer_dataset_profile(
+    backend: InferenceBackend,
+    documents: list[SourceDocument],
+    *,
+    sample_docs: int = 1,
+) -> DatasetProfile:
+    if not documents:
+        raise ValueError("At least one document is required to infer a dataset profile")
+    sample = documents[: max(1, min(sample_docs, len(documents)))]
+    prompt = f"""Identify this dataset and decide what supervised instruction data should extract from it.
+Use only a brief skim of the samples (do not assume you read the whole corpus).
+Do not invent a domain that is unsupported by the samples.
+Focus on modalities that make the eventual instruction/output pairs faithful to the source.
+
+Diversity requirements (critical):
+- List 4 to 6 distinct preferred_task_types that are actually supported by the samples. Cover different cognitive
+  moves (e.g. define, explain mechanism, diagnose/classify, apply a rule/procedure, compare, extract criteria,
+  contraindications/edge cases) — not minor wording variants of one task.
+- Do NOT overweight one modality. For clinical/medical sources, treatments are only ONE of several equal options
+  alongside presentation/findings, diagnostic criteria, differentials, pathophysiology, complications, and
+  contraindications/monitoring.
+- instruction_guidance must describe ABSTRACT phrasing rules only (standalone, named subject, no demonstratives).
+  It must NOT contain a concrete sample question, template, or single canonical stem such as
+  "What is the first-line treatment for ...?".
+- answer_guidance should allow concise factual answers, short lists, and brief explanations — not only
+  "recommend treatment" style responses.
+- Put "repeating the same task type or instruction stem across rows" in avoid.
+
+Examples of modality adaptation (balanced — do not reduce a domain to one bullet):
+- Math textbooks: formulas, identities, theorem statements, proof steps, worked calculations.
+- Case law: holdings, procedural posture, standards of review, rule applications, remedies.
+- Clinical / medical handbooks: findings, diagnostic criteria, differentials, mechanisms, treatments,
+  contraindications, complications — treat these as co-equal.
+- Code or API docs: signatures, failure modes, edge cases, repair steps, invariants.
+
+Return only:
+{{
+  "domain": "short domain label",
+  "source_kind": "textbook|case_law|clinical_notes|code|research_paper|news|other",
+  "content_signals": ["signal1", "signal2", "signal3"],
+  "extractable_assets": ["asset1", "asset2", "asset3"],
+  "preferred_task_types": ["task1", "task2", "task3", "task4"],
+  "instruction_guidance": "abstract phrasing rules only; no example questions",
+  "answer_guidance": "how answers should be phrased across the diverse task types",
+  "avoid": ["repeating the same task type or instruction stem across rows", "..."],
+  "recommended_chunk_level": "document|section|paragraph|line|needle|page"
+}}
+
+Sample skim:
+{json.dumps(_brief_skim_excerpts(sample, max_docs=len(sample), max_chars=900), ensure_ascii=False)}
+"""
+    value = _retry_json(backend, _PROFILE_SYSTEM, prompt, max_new_tokens=900, attempts=3)
+    if not isinstance(value, dict):
+        raise ValueError("Dataset profile response must be a JSON object")
+    profile = DatasetProfile.from_dict(value)
+    return _normalize_dataset_profile(profile)
+
+
+def _normalize_dataset_profile(profile: DatasetProfile) -> DatasetProfile:
+    """Clamp profile fields so one task pattern cannot dominate generation."""
+    tasks = list(profile.preferred_task_types)
+    # Drop near-duplicate task labels (same when casefolded / underscored).
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for task in tasks:
+        key = re.sub(r"[\s\-]+", "_", task.strip().casefold())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(task.strip())
+    if len(deduped) < 3:
+        # Fallback mix; generation still has to stay CONTEXT-supported.
+        for extra in DEFAULT_TASK_FOCUSES:
+            if extra not in seen:
+                deduped.append(extra)
+                seen.add(extra)
+            if len(deduped) >= 4:
+                break
+    tasks = tuple(deduped[:6])
+
+    guidance = profile.instruction_guidance.strip()
+    # Strip accidental concrete stems/examples that overfit all rows to one pattern.
+    if "?" in guidance or re.search(
+        r"\be\.g\.\b|\bfor example\b|\bfirst-line treatment\b|\blist (?:the )?diagnostic criteria\b",
+        guidance,
+        re.I,
+    ):
+        guidance = (
+            "Write standalone instructions that name the subject explicitly. "
+            "Vary the cognitive task across rows using the preferred task types; "
+            "do not reuse one stem. Never refer to the source document or its headings by name."
+        )
+    # Soften stem-like task labels into abstract cognitive moves.
+    abstract_tasks: list[str] = []
+    for task in tasks:
+        lowered = task.casefold()
+        if re.match(r"^list\b", lowered) and "criteria" in lowered:
+            abstract_tasks.append("state_supported_criteria_or_essentials")
+        elif "first-line treatment" in lowered or lowered.startswith("recommend treatment"):
+            abstract_tasks.append("identify_supported_management_or_treatment_options")
+        else:
+            abstract_tasks.append(task)
+    tasks = tuple(dict.fromkeys(abstract_tasks))  # preserve order, drop dups
+
+    avoid = list(profile.avoid)
+    for item in (
+        "repeating the same task type or instruction stem across rows",
+        "referencing the source document, section, or passage by name or provenance",
+    ):
+        if not any(item.casefold() in existing.casefold() for existing in avoid):
+            avoid.insert(0, item)
+
+    return DatasetProfile(
+        domain=profile.domain,
+        source_kind=profile.source_kind,
+        content_signals=profile.content_signals,
+        extractable_assets=profile.extractable_assets,
+        preferred_task_types=tasks,
+        instruction_guidance=guidance,
+        answer_guidance=profile.answer_guidance,
+        avoid=tuple(avoid),
+        recommended_chunk_level=profile.recommended_chunk_level,
+    )
+
+
+def save_dataset_profile(path: Path, profile: DatasetProfile) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profile.to_dict(), indent=2) + "\n")
+
+
+def load_dataset_profile(path: Path) -> DatasetProfile:
+    return DatasetProfile.from_dict(json.loads(path.read_text()))
+
+
+def assign_task_focuses(task_types: tuple[str, ...] | list[str], n_rows: int) -> list[str]:
+    """Round-robin task focuses so rows do not collapse onto one preferred_task_type."""
+    types = [item.strip() for item in task_types if isinstance(item, str) and item.strip()]
+    if not types:
+        types = list(DEFAULT_TASK_FOCUSES)
+    if n_rows <= 0:
+        return []
+    return [types[index % len(types)] for index in range(n_rows)]
+
+
+def infer_personas(
+    backend: InferenceBackend,
+    documents: list[SourceDocument],
+    maximum: int = 5,
+    *,
+    include_builtins: bool = True,
+    analysis_batch_size: int = 50,
+    dataset_profile: DatasetProfile | None = None,
+) -> list[Persona]:
+    if not documents:
+        raise ValueError("At least one document is required to infer personas")
+
+    # Fast path: brief skim + one call (no batch/consolidate round-trip).
+    if maximum <= 2 or len(documents) <= 2:
+        profile_block = (
+            f"Dataset profile to respect:\n{dataset_profile.prompt_block()}\n"
+            if dataset_profile is not None
+            else "No dataset profile was supplied; infer personas from the skim alone.\n"
+        )
+        prompt = f"""From a brief head/middle/tail skim, propose exactly {maximum} broad, distinct personas.
+{profile_block}
+Do not include summarizer, needle-in-haystack, detail-researcher, or line-analyst.
+Each persona must work on one document/row and produce a self-contained instruction+answer pair.
+Keep description and question_style to one short sentence; prefer chunk_level paragraph or section.
+
+Return only:
+{{"personas": [
+  {{"name": "short-kebab-name", "description": "who they are and their goal",
+    "chunk_level": "document|section|paragraph|line|needle|page", "question_style": "adaptable instruction behavior"}}
+]}}
+
+Source skim:
+{json.dumps(_brief_skim_excerpts(documents, max_docs=min(2, len(documents)), max_chars=900), ensure_ascii=False)}
+"""
+        value = _retry_json(backend, _PERSONA_SYSTEM, prompt, max_new_tokens=700, attempts=3)
+        generated = _parse_personas(value, maximum)
+        if not generated:
+            raise ValueError("Persona inference returned no personas")
+        generated = generated[:maximum]
+        return merge_personas(generated) if include_builtins else generated
+
+    profile_block = (
+        f"Dataset profile to respect:\n{dataset_profile.prompt_block()}\n"
+        if dataset_profile is not None
+        else "No dataset profile was supplied; infer personas from the samples alone.\n"
+    )
+    candidate_personas: list[Persona] = []
+    candidate_limit = min(maximum + 3, 10)
+    for batch_number, start in enumerate(range(0, len(documents), analysis_batch_size), start=1):
+        batch = documents[start : start + analysis_batch_size]
+        prompt = f"""Analyze dataset sample batch {batch_number} and propose up to {candidate_limit} broad user roles.
+Infer who would realistically use the recurring information in this dataset and what they would ask an assistant to do.
+{profile_block}
+Each role must be useful for typical rows, not tied to one named entity, event, topic instance, or sample excerpt.
+The pipeline gives the role one row or document at a time, so its tasks must be answerable from one row without
+requiring statistics, comparisons, or evidence from other rows.
+The final training projection contains only the instruction and answer, not the source document. Exclude roles whose
+core task is summarizing a whole document, extracting source-specific metadata, translating an unseen passage, or
+otherwise acting on content that cannot be compactly established inside the instruction.
+Prefer roles that turn source facts into self-contained reasoning, decisions, explanations, or recommendations.
+If the dataset profile lists extractable assets such as formulas, holdings, or code signatures, personas should
+exercise those assets rather than only asking generic reading-comprehension questions.
+The legacy question_style field describes instruction behavior, not a sample question. Keep it abstract and
+adaptable across rows, use action-oriented wording, and do not refer to "this" or "that" source entity.
+It may describe questions, direct commands, requests, or workflow tasks.
+Describe behavior such as "Simplify source language for a general audience", not literal templates such as
+"Translate this paragraph".
+Return only:
+{{"personas": [
+  {{"name": "short-kebab-name", "description": "broad role and goal",
+    "chunk_level": "document|section|paragraph|line|needle|page", "question_style": "adaptable instruction behavior"}}
+]}}
+
+Sample skim:
+{json.dumps(_brief_skim_excerpts(batch, max_docs=min(3, len(batch)), max_chars=700), ensure_ascii=False)}
+"""
+        value = _retry_json(backend, _PERSONA_SYSTEM, prompt, max_new_tokens=900, attempts=3)
+        candidate_personas.extend(_parse_personas(value, candidate_limit))
+
+    prompt = f"""Consolidate these batch-level candidates into exactly {maximum} broad, distinct personas.
+They represent analysis of {len(documents)} rows from the dataset.
+{profile_block}
+Each persona must represent a realistic user and source-grounded tasks that work for a typical individual row.
+Do not specialize around one named entity, event, narrow topic instance, or example excerpt.
+Because generation receives one row at a time, exclude roles whose core task requires aggregating multiple rows.
+Because the final training pair does not include the source, also exclude roles centered on whole-document summaries,
+source-specific metadata extraction, or transformations of an unseen passage. The required facts or target must fit
+naturally inside a standalone instruction.
+Make the personas operationally distinct: they should request different kinds of reasoning or transformation,
+not merely use different job titles for the same task.
+Align personas with the dataset profile's preferred task types and extractable assets when provided.
+The legacy question_style field describes instruction behavior. Keep it abstract, action-oriented, and adaptable;
+it may describe questions, commands, requests, or multi-step tasks, but it must not contain example facts or
+refer to "this" or "that" source entity.
+Describe behavior such as "Extract procedural history from one document", not a literal instruction containing
+"this case", "this document", or "this paragraph".
+Do not include summarizer, needle-in-haystack, or generic fact-recall personas because those are always added.
+
+Return:
+{{"personas": [
+  {{"name": "short-kebab-name", "description": "who they are and their goal",
+    "chunk_level": "document|section|paragraph|line|needle|page", "question_style": "instructions they would give"}}
+]}}
+
+Batch-level candidates:
+{json.dumps([persona.to_dict() for persona in candidate_personas], ensure_ascii=False)}
+"""
+    value = _retry_json(backend, _PERSONA_SYSTEM, prompt, max_new_tokens=900, attempts=3)
+    generated = _parse_personas(value, maximum)
+    if len(generated) != maximum:
+        raise ValueError(f"Expected {maximum} unique generated personas, received {len(generated)}")
+    return merge_personas(generated) if include_builtins else generated
+
+
+def infer_personas_from_profile(
+    backend: InferenceBackend,
+    dataset_profile: DatasetProfile,
+    maximum: int = 2,
+) -> list[Persona]:
+    """Compact profile-only persona inference (fallback when sample-based JSON fails)."""
+    if maximum < 1:
+        raise ValueError("maximum must be at least 1")
+    prompt = f"""Propose exactly {maximum} broad, distinct personas for this dataset profile.
+Do not include summarizer, needle-in-haystack, detail-researcher, or line-analyst — those are already added.
+Each persona must work on one document/row at a time and produce a self-contained instruction+answer pair.
+Prefer chunk_level paragraph or section unless line-level is clearly better.
+Keep description and question_style short (one sentence each).
+
+Dataset profile:
+{dataset_profile.prompt_block()}
+
+Return only:
+{{"personas": [
+  {{"name": "short-kebab-name", "description": "who they are and their goal",
+    "chunk_level": "document|section|paragraph|line|needle|page", "question_style": "instruction behavior"}}
+]}}
+"""
+    value = _retry_json(backend, _PERSONA_SYSTEM, prompt, max_new_tokens=900, attempts=3)
+    generated = _parse_personas(value, maximum)
+    if not generated:
+        raise ValueError("Profile-only persona inference returned no personas")
+    return generated[:maximum]
+
+
+def save_personas(path: Path, personas: list[Persona]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"personas": [persona.to_dict() for persona in personas]}, indent=2) + "\n")
+
+
+def load_personas(path: Path) -> list[Persona]:
+    value = json.loads(path.read_text())
+    items = value.get("personas", [])
+    if not isinstance(items, list):
+        raise ValueError("Persona file must contain a personas list")
+    return [Persona.from_dict(item) for item in items]
+
+
+def summarize_document(
+    backend: InferenceBackend,
+    tree: DocumentTree,
+    max_piece_chars: int = 12_000,
+    *,
+    workers: int = 1,
+) -> str:
+    """Build one document overview with a single LLM call (truncated to model context).
+
+    `max_piece_chars` and `workers` are retained for call-site compatibility but ignored:
+    multi-piece map-reduce was slower on remote APIs and unnecessary for a header summary.
+    """
+    del max_piece_chars, workers  # unused; kept for signature compatibility
+
+    full_text = "\n\n".join(section.text for section in tree.sections if section.text.strip())
+    if not full_text.strip():
+        raise ValueError("Document has no useful prose to summarize")
+
+    max_input = int(getattr(backend, "max_input_tokens", 16_000) or 16_000)
+    # Leave headroom for system prompt, instructions, and completion.
+    budget_tokens = max(2_000, max_input - 1_500)
+    count_tokens = getattr(backend, "count_tokens", None)
+    if callable(count_tokens):
+        if count_tokens(full_text) <= budget_tokens:
+            source = full_text
+        else:
+            # Approximate char cut, then trim until within budget.
+            approx_chars = max(4_000, budget_tokens * 4)
+            source = full_text[:approx_chars]
+            while len(source) > 4_000 and count_tokens(source) > budget_tokens:
+                source = source[: int(len(source) * 0.9)]
+    else:
+        source = full_text[: budget_tokens * 4]
+
+    truncated = len(source) < len(full_text)
+    prompt = (
+        'Return JSON {"summary": "..."} with a faithful document overview in 3-6 sentences '
+        "(about 120-220 words). Cover document type, scope, and the main topics or provisions. "
+        "Do not invent details that are not present.\n"
+    )
+    if truncated:
+        prompt += (
+            "Note: only the beginning of the document is provided (context-window limit); "
+            "summarize what is present.\n"
+        )
+    prompt += "\nDOCUMENT:\n" + source
+
+    value = _retry_json(
+        backend,
+        _SUMMARY_SYSTEM,
+        prompt,
+        # Thinking burns the token budget on Qwen3/OpenRouter and truncates JSON.
+        max_new_tokens=1_000,
+        attempts=3,
+        enable_thinking=False,
+    )
+    summary = value.get("summary") if isinstance(value, dict) else None
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("Summary response is missing summary")
+    return summary.strip()
+
+
+def apply_chunk_level(personas: list[Persona], chunk_level: ChunkLevel) -> list[Persona]:
+    if chunk_level not in CHUNK_LEVELS:
+        raise ValueError(f"Unsupported chunk level: {chunk_level}")
+    return [
+        Persona(
+            name=persona.name,
+            description=persona.description,
+            chunk_level=chunk_level,
+            question_style=persona.question_style,
+        )
+        for persona in personas
+    ]
+
+
+def is_prompt_only_chunk(text: str) -> bool:
+    """True when text mostly poses tasks/questions without answer material."""
+    value = text.strip()
+    if not value:
+        return True
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    task_lines = 0
+    numbered_prompts = 0
+    for line in lines:
+        if line.endswith("?") or _TASK_PROMPT_LINE_RE.search(line):
+            task_lines += 1
+        if re.match(r"^\(?\d+(?:\.\d+)*\)?[.)]?\s+\S", line) and (
+            line.endswith("?") or _TASK_PROMPT_LINE_RE.search(line) or len(line) < 180
+        ):
+            numbered_prompts += 1
+
+    answer_hits = len(_ANSWER_BEARING_RE.findall(value))
+    question_marks = value.count("?")
+    task_ratio = task_lines / len(lines)
+    numbered_ratio = numbered_prompts / len(lines)
+
+    if task_ratio >= 0.55 and answer_hits <= 1:
+        return True
+    if question_marks >= 3 and answer_hits == 0 and task_ratio >= 0.35:
+        return True
+    if numbered_ratio >= 0.5 and numbered_prompts >= 3 and answer_hits <= 1:
+        return True
+    return False
+
+
+def is_high_value_chunk(text: str, *, minimum_chars: int = 80) -> bool:
+    value = text.strip()
+    if len(value) < minimum_chars:
+        return False
+    if is_prompt_only_chunk(value):
+        return False
+    if _LOW_VALUE_CHUNK_RE.search(value):
+        # Allow long passages that only mention a cross-reference in passing.
+        if len(value) < 500 or _LOW_VALUE_CHUNK_RE.sub("", value).strip() == "":
+            return False
+        cross_ref_ratio = sum(len(match.group(0)) for match in _LOW_VALUE_CHUNK_RE.finditer(value)) / len(value)
+        if cross_ref_ratio > 0.12:
+            return False
+    if _FRAGMENT_START_RE.match(value):
+        return False
+    words = re.findall(r"\b[\w'-]+\b", value)
+    if len(words) < 12:
+        return False
+    alpha = sum(char.isalpha() for char in value)
+    if alpha / max(len(value), 1) < 0.45:
+        return False
+    return True
+
+
+def _candidate_sections(tree: DocumentTree) -> list:
+    sections = [section for section in tree.sections if is_high_value_chunk(section.text, minimum_chars=160)]
+    if sections:
+        return sections
+    return [
+        section
+        for section in tree.sections
+        if len(section.text) >= 160 and not is_prompt_only_chunk(section.text)
+    ]
+
+
+def _candidate_pages(tree: DocumentTree) -> list[tuple[str, str, int]]:
+    """Return (page_text, path_label, start_offset) candidates for page-level sampling."""
+    text = tree.cleaned_text
+    if "\f" in text:
+        raw_pages = [part.strip() for part in text.split("\f") if part.strip()]
+    else:
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+        raw_pages = []
+        current: list[str] = []
+        current_len = 0
+        for para in paragraphs:
+            if current and current_len + len(para) > 2_500:
+                raw_pages.append("\n\n".join(current))
+                current = [para]
+                current_len = len(para)
+            else:
+                current.append(para)
+                current_len += len(para) + 2
+        if current:
+            raw_pages.append("\n\n".join(current))
+
+    results: list[tuple[str, str, int]] = []
+    search_from = 0
+    for index, page in enumerate(raw_pages, start=1):
+        if not is_high_value_chunk(page, minimum_chars=80) and not (
+            len(page) >= 80 and not is_prompt_only_chunk(page)
+        ):
+            continue
+        offset = text.find(page, search_from)
+        if offset < 0:
+            offset = search_from
+        results.append((page, f"Page {index}", offset))
+        search_from = offset + max(len(page), 1)
+    return results
+
+
+def _candidate_paragraphs(section) -> list[str]:
+    paragraphs = [
+        paragraph for paragraph in section.paragraphs if is_high_value_chunk(paragraph, minimum_chars=80)
+    ]
+    if paragraphs:
+        return paragraphs
+    return [
+        paragraph
+        for paragraph in section.paragraphs
+        if len(paragraph) >= 80 and not is_prompt_only_chunk(paragraph)
+    ]
+
+
+def _candidate_lines(text: str) -> list[str]:
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if is_high_value_chunk(line, minimum_chars=40):
+            lines.append(line)
+    if lines:
+        return lines
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if len(line.strip()) >= 40 and not is_prompt_only_chunk(line.strip())
+    ]
+
+
+def list_candidate_chunks(
+    tree: DocumentTree,
+    persona: Persona,
+    max_context_chars: int = 16_000,
+) -> list[SampledChunk]:
+    """Split the document into the persona's chunk units, in document order."""
+    if not tree.sections:
+        raise ValueError("Document has no useful sections")
+    level = persona.chunk_level
+    chunks: list[SampledChunk] = []
+
+    if level == "document":
+        text = tree.cleaned_text[:max_context_chars]
+        if not is_high_value_chunk(text, minimum_chars=160):
+            raise ValueError("Document text is not usable for generation")
+        return [SampledChunk(text, text, tree.document.title, "document", "document-prefix", 0, len(text))]
+
+    if level == "page":
+        for page_text, page_path, page_start in _candidate_pages(tree):
+            text = page_text[:max_context_chars]
+            if is_prompt_only_chunk(text) or not is_high_value_chunk(text, minimum_chars=120):
+                continue
+            chunks.append(
+                SampledChunk(
+                    text,
+                    text,
+                    page_path,
+                    "page",
+                    "page-unit",
+                    page_start,
+                    page_start + len(text),
+                )
+            )
+        if not chunks:
+            raise ValueError("Document has no usable pages for generation")
+        return chunks
+
+    sections = _candidate_sections(tree)
+    if not sections:
+        raise ValueError("Document has no usable sections for generation")
+
+    if level == "section":
+        for section in sections:
+            text = section.text[:max_context_chars]
+            if is_prompt_only_chunk(text) or not is_high_value_chunk(text, minimum_chars=160):
+                continue
+            chunks.append(
+                SampledChunk(
+                    text,
+                    text,
+                    section.path,
+                    "section",
+                    "native-section",
+                    section.start,
+                    section.start + len(text),
+                )
+            )
+        if not chunks:
+            raise ValueError("No high-value section remained after filtering")
+        return chunks
+
+    for section in sections:
+        if level == "line":
+            lines = _candidate_lines(section.text)
+            for index, target in enumerate(lines):
+                left = max(0, index - 1)
+                right = min(len(lines), index + 2)
+                window = "\n".join(lines[left:right])[: max(500, min(1_500, max_context_chars))]
+                line_offset = section.text.find(target)
+                line_start = section.start + max(line_offset, 0)
+                chunks.append(
+                    SampledChunk(
+                        window,
+                        target,
+                        section.path,
+                        "line",
+                        "line-window",
+                        line_start,
+                        line_start + len(target),
+                    )
+                )
+            continue
+
+        useful_paragraphs = _candidate_paragraphs(section)
+        if not useful_paragraphs:
+            continue
+
+        if level == "needle":
+            envelope = section.text[:max_context_chars]
+            for paragraph in useful_paragraphs:
+                paragraph_offset = section.text.find(paragraph)
+                start = section.start + max(paragraph_offset, 0)
+                sentences = [
+                    sentence
+                    for sentence in split_sentences(paragraph)
+                    if is_high_value_chunk(sentence, minimum_chars=40)
+                ] or [paragraph]
+                for target in sentences:
+                    chunks.append(
+                        SampledChunk(
+                            envelope,
+                            target,
+                            section.path,
+                            "needle",
+                            "sentence-target-in-section-envelope",
+                            start,
+                            start + len(paragraph),
+                        )
+                    )
+            continue
+
+        # paragraph (default for detail-researcher)
+        window_paragraphs = [
+            paragraph for paragraph in section.paragraphs if is_high_value_chunk(paragraph, minimum_chars=60)
+        ] or [paragraph for paragraph in section.paragraphs if not is_prompt_only_chunk(paragraph)]
+        if not window_paragraphs:
+            continue
+        for paragraph in useful_paragraphs:
+            if paragraph not in window_paragraphs:
+                continue
+            paragraph_offset = section.text.find(paragraph)
+            start = section.start + max(paragraph_offset, 0)
+            window = _paragraph_window(
+                window_paragraphs,
+                window_paragraphs.index(paragraph),
+                max_context_chars=min(4_000, max_context_chars),
+            )
+            if is_prompt_only_chunk(window) or not is_high_value_chunk(window, minimum_chars=120):
+                continue
+            chunks.append(
+                SampledChunk(
+                    window,
+                    paragraph[:max_context_chars],
+                    section.path,
+                    "paragraph",
+                    "paragraph-window",
+                    start,
+                    start + len(paragraph),
+                )
+            )
+
+    if not chunks:
+        raise ValueError(f"No usable {level} chunks remained after filtering")
+    return chunks
+
+
+def assign_chunk_indexes(n_chunks: int, n_rows: int) -> list[int]:
+    """Evenly map row slots onto a chunk list (document order, no random choice)."""
+    if n_chunks <= 0:
+        raise ValueError("No candidate chunks available")
+    if n_rows <= 0:
+        return []
+    if n_rows == 1:
+        return [0]
+    if n_rows <= n_chunks:
+        # Unique, evenly spaced spans across the document.
+        return [int(i * n_chunks / n_rows) for i in range(n_rows)]
+    # More rows than chunks: cycle so each chunk is used about equally often.
+    return [i % n_chunks for i in range(n_rows)]
+
+
+def assign_chunks_evenly(chunks: list[SampledChunk], n_rows: int) -> list[SampledChunk]:
+    """Map rows onto the chunk list with even document coverage (no random choice)."""
+    indexes = assign_chunk_indexes(len(chunks), n_rows)
+    return [chunks[i] for i in indexes]
+
+
+def _paragraph_anchor_chunks(tree: DocumentTree, max_context_chars: int = 16_000) -> list[SampledChunk]:
+    """Paragraph-level anchors used for shared multi-persona sampling."""
+    anchor_persona = Persona(
+        name="_paragraph-anchor",
+        description="Internal paragraph anchor",
+        chunk_level="paragraph",
+        question_style="n/a",
+    )
+    try:
+        return list_candidate_chunks(tree, anchor_persona, max_context_chars=max_context_chars)
+    except ValueError:
+        return []
+
+
+def _chunks_overlapping(pool: list[SampledChunk], anchor: SampledChunk) -> list[SampledChunk]:
+    return [chunk for chunk in pool if chunk.start < anchor.end and chunk.end > anchor.start]
+
+
+def _synthesize_line_from_anchor(anchor: SampledChunk, rng: random.Random) -> SampledChunk | None:
+    source = (anchor.target_text or anchor.text or "").strip()
+    if not source:
+        return None
+    lines = _candidate_lines(source)
+    if not lines:
+        return None
+    target = rng.choice(lines)
+    index = lines.index(target)
+    left = max(0, index - 1)
+    right = min(len(lines), index + 2)
+    window = "\n".join(lines[left:right])[:1_500]
+    offset = source.find(target)
+    start = anchor.start + max(offset, 0)
+    return SampledChunk(
+        window,
+        target,
+        anchor.section_path,
+        "line",
+        "line-from-anchor",
+        start,
+        start + len(target),
+    )
+
+
+def _project_chunk_for_persona(
+    persona: Persona,
+    anchor: SampledChunk,
+    pool: list[SampledChunk],
+    rng: random.Random,
+) -> SampledChunk | None:
+    """Map a shared paragraph anchor onto a native chunk for ``persona``."""
+    overlapping = _chunks_overlapping(pool, anchor)
+    if overlapping:
+        return rng.choice(overlapping)
+    if persona.chunk_level == "paragraph":
+        return anchor
+    if persona.chunk_level == "line":
+        return _synthesize_line_from_anchor(anchor, rng)
+    if pool:
+        return min(pool, key=lambda chunk: abs(chunk.start - anchor.start))
+    return None
+
+
+def _sample_without_replacement(
+    items: list[SampledChunk],
+    k: int,
+    rng: random.Random,
+) -> list[SampledChunk]:
+    if k <= 0 or not items:
+        return []
+    if k >= len(items):
+        shuffled = list(items)
+        rng.shuffle(shuffled)
+        return shuffled
+    return rng.sample(items, k)
+
+
+def build_generation_work(
+    tree: DocumentTree,
+    personas: list[Persona],
+    pools: dict[str, list[SampledChunk]],
+    *,
+    goal: int,
+    profile_tasks: list[str],
+    seed: int,
+    sample_mode: str = "auto",
+) -> list[tuple[int, Persona, SampledChunk, int, str]]:
+    """Build a shuffled work queue: random native subsample or shared anchors.
+
+    When ``goal`` is below first-pass capacity, subsample without replacement.
+    ``sample_mode``:
+      - ``shared_anchor``: K random paragraph anchors, projected to each persona
+      - ``independent``: per-persona random subsample from native pools
+      - ``auto``: shared_anchor when 2+ personas, else independent
+    """
+    if goal < 1:
+        return []
+    active = [persona for persona in personas if pools.get(persona.name)]
+    if not active:
+        return []
+
+    mode = sample_mode
+    if mode == "auto":
+        mode = "shared_anchor" if len(active) >= 2 else "independent"
+    if mode not in {"shared_anchor", "independent"}:
+        raise ValueError(f"Unsupported sample_mode: {sample_mode}")
+
+    rng = random.Random(seed)
+    tasks = list(profile_tasks) or list(DEFAULT_TASK_FOCUSES)
+    angle_passes = max(1, min(4, len(tasks)))
+    # Equal soft share per persona; K = ceil(goal / n_personas) shared anchors.
+    slots_per_persona = max(1, (goal + len(active) - 1) // len(active))
+    total_pool = sum(len(pools.get(persona.name) or []) for persona in active)
+    full_coverage = goal >= total_pool
+    # First pass covers K (or full pool); one extra angle pass for failure/dedup headroom.
+    max_passes = angle_passes if full_coverage else min(angle_passes, 2)
+
+    work: list[tuple[Persona, SampledChunk, int, str]] = []
+    task_cursor = 0
+
+    def _next_task_focus() -> str:
+        nonlocal task_cursor
+        focus = tasks[task_cursor % len(tasks)]
+        task_cursor += 1
+        return focus
+
+    def _append_projected(anchor: SampledChunk) -> None:
+        for persona in active:
+            pool = pools.get(persona.name) or []
+            chunk = _project_chunk_for_persona(persona, anchor, pool, rng)
+            if chunk is None:
+                continue
+            try:
+                pool_index = pool.index(chunk)
+            except ValueError:
+                pool_index = abs(hash((chunk.start, chunk.end, chunk.level))) % max(len(pool), 1)
+            work.append((persona, chunk, pool_index, _next_task_focus()))
+
+    if mode == "shared_anchor":
+        anchors = _paragraph_anchor_chunks(tree)
+        if not anchors:
+            mode = "independent"
+        else:
+            for pass_i in range(max_passes):
+                if full_coverage:
+                    n_anchors = len(anchors)
+                elif pass_i == 0:
+                    n_anchors = min(len(anchors), slots_per_persona)
+                else:
+                    # Spare anchors (~50%) for retries after dedup/failures.
+                    n_anchors = min(len(anchors), max(1, (slots_per_persona + 1) // 2))
+                chosen = _sample_without_replacement(anchors, n_anchors, rng)
+                for anchor in chosen:
+                    _append_projected(anchor)
+
+    if mode == "independent":
+        work = []
+        task_cursor = 0
+        for pass_i in range(max_passes):
+            for persona in active:
+                pool = pools.get(persona.name) or []
+                if not pool:
+                    continue
+                if full_coverage:
+                    k = len(pool)
+                elif pass_i == 0:
+                    k = min(len(pool), slots_per_persona)
+                else:
+                    k = min(len(pool), max(1, (slots_per_persona + 1) // 2))
+                chosen = _sample_without_replacement(pool, k, rng)
+                for chunk in chosen:
+                    try:
+                        pool_index = pool.index(chunk)
+                    except ValueError:
+                        pool_index = 0
+                    work.append((persona, chunk, pool_index, _next_task_focus()))
+
+    if not work:
+        return []
+
+    rng.shuffle(work)
+    return [
+        (index, persona, chunk, pool_index, task_focus)
+        for index, (persona, chunk, pool_index, task_focus) in enumerate(work)
+    ]
+
+
+def sample_chunk(
+    tree: DocumentTree,
+    persona: Persona,
+    rng: random.Random,
+    max_context_chars: int = 16_000,
+) -> SampledChunk:
+    """Compatibility helper: return one chunk from the pre-split candidate list."""
+    del rng  # assignment is even/deterministic; kept for call-site compatibility
+    chunks = list_candidate_chunks(tree, persona, max_context_chars=max_context_chars)
+    return chunks[0]
+
+
+def _paragraph_window(paragraphs: tuple[str, ...] | list[str], target_index: int, *, max_context_chars: int) -> str:
+    """Expand around a target paragraph until the local window is usefully large."""
+    if not paragraphs:
+        return ""
+    target_index = max(0, min(target_index, len(paragraphs) - 1))
+    left = right = target_index
+    window = paragraphs[target_index]
+    min_chars = min(1_200, max_context_chars)
+    while len(window) < min_chars and (left > 0 or right + 1 < len(paragraphs)):
+        take_left = left > 0 and (right + 1 >= len(paragraphs) or (target_index - left) <= (right - target_index))
+        if take_left:
+            left -= 1
+            neighbor = paragraphs[left]
+            if not is_high_value_chunk(neighbor, minimum_chars=40):
+                continue
+            candidate = f"{neighbor}\n\n{window}"
+        else:
+            right += 1
+            neighbor = paragraphs[right]
+            if not is_high_value_chunk(neighbor, minimum_chars=40):
+                continue
+            candidate = f"{window}\n\n{neighbor}"
+        if len(candidate) > max_context_chars and len(window) >= min(400, min_chars):
+            break
+        window = candidate
+    return window[:max_context_chars]
+
+
+def sample_pair_augmentation(
+    rng: random.Random,
+    *,
+    task_focus: str | None = None,
+    form_index: int | None = None,
+) -> dict[str, str]:
+    specificity = rng.choices(
+        [
+            "Preserve exact details that materially affect the task; remove only irrelevant source-specific identity.",
+            "Generalize nonessential entity attributes to a truthful role, type, or category.",
+            "When precision is not material, replace a nonessential exact number or date "
+            "with a truthful bounded range or category.",
+            "Use the minimum source details needed for a useful, answerable instruction.",
+        ],
+        weights=[0.35, 0.30, 0.20, 0.15],
+        k=1,
+    )[0]
+    forms = [
+        "Knowledge recall: ask an independently understandable 'What is X?' style question naming the subject.",
+        "Explanation: ask to explain why X happens or how a mechanism works, using a direct command or question.",
+        "Transformation: ask to summarize, classify, or structure X into a clearer form.",
+        "Comparison: contrast two named conditions, findings, or rules supported by CONTEXT (X vs Y).",
+        "Application: given a short named scenario S, ask how to apply rule or concept X.",
+        "Reasoning: ask what follows from X / what can be inferred from the stated facts.",
+        "Critique: ask whether claim C is correct or supported, and why.",
+        "Decision: ask when X should be used (or not), with criteria grounded in CONTEXT.",
+        "Use a natural request such as 'Tell me...', 'Help me...', or 'Walk me through...'.",
+        "Use a workflow-style instruction that asks the persona's task to be carried out.",
+    ]
+    if form_index is None:
+        instruction_form = rng.choice(forms)
+    else:
+        instruction_form = forms[form_index % len(forms)]
+    return {
+        "specificity": specificity,
+        "entity_style": rng.choice(
+            [
+                "Introduce generalized entities by an indefinite role or type before referring to them.",
+                "Prefer domain-relevant roles and categories over incidental names or identifiers.",
+                "Retain a proper name or identifier only when it is central to the task or answer.",
+            ]
+        ),
+        "instruction_form": instruction_form,
+        "task_focus": (task_focus or "use a CONTEXT-supported task distinct from neighboring rows").strip(),
+    }
+
+
+def generate_pair(
+    backend: InferenceBackend,
+    persona: Persona,
+    chunk: SampledChunk,
+    header: str,
+    *,
+    require_standalone: bool,
+    augmentation: dict[str, str],
+    dataset_profile: DatasetProfile | None = None,
+) -> GeneratedPair:
+    profile_block = (
+        f"Dataset profile:\n{dataset_profile.prompt_block()}\n"
+        if dataset_profile is not None
+        else "Dataset profile: none supplied; stay faithful to CONTEXT alone.\n"
+    )
+    task_focus = augmentation.get("task_focus") or "CONTEXT-supported task"
+    prompt = f"""Create exactly one source-grounded instruction/answer pair that can be used without showing the source.
+The source may come from any domain, but you must adapt to the dataset profile below when one is provided.
+
+Persona: {persona.name}
+Goal: {persona.description}
+Question style (tendency only — do NOT reuse one fixed stem on every row): {persona.question_style}
+Standalone required: {str(require_standalone).lower()}
+
+{profile_block}
+Perspective:
+- Imagine a realistic user represented by PERSONA is using the information in CONTEXT.
+- For THIS row, prioritize the assigned task focus below when CONTEXT supports it. If CONTEXT cannot support
+  that focus, pick the nearest supported alternative from the profile's preferred task types — do not default
+  to whichever stem is most familiar for the domain.
+- Assigned task focus for this row: {task_focus}
+- Write that task as the instruction, then write the answer that would satisfy the user.
+- The persona controls the goal and type of work, not the wording used to refer to hidden source material.
+- HEADER, document summary, and section path are private scaffolding only — never quote or allude to them in
+  the instruction or output.
+- Use extractable assets from CONTEXT when relevant (criteria, definitions, mechanisms, rules, formulas, etc.),
+  not only the most common action-oriented pattern for the domain.
+- First choose a task that CONTEXT can fully answer. If CONTEXT only states a result, definition, holding,
+  finding, or procedure incompletely, ask for what is explicitly present. Do not invent missing steps,
+  lemmas, citations, numbers, code, diagnoses, or arguments.
+- Never answer a question or task that CONTEXT only poses unless CONTEXT also contains the supporting
+  facts, procedure, ruling, result, or explanation needed to answer it. Prompt-only or unanswered-task
+  chunks are invalid sources for answered pairs.
+
+Variation profile for this example:
+- Task focus: {task_focus}
+- Specificity: {augmentation["specificity"]}
+- Entities: {augmentation["entity_style"]}
+- Instruction form: {augmentation["instruction_form"]}
+
+Core requirements:
+- Follow the requested instruction form. An instruction may be a question, direct command, natural request, or
+  workflow task; do not force every instruction into a "What is...?" or "Recommend treatment..." stem.
+- Follow the dataset profile's instruction_guidance and answer_guidance when provided, but never let them
+  collapse every row into one task type.
+- Avoid the behaviors listed in the dataset profile's avoid list.
+- The answer must be fully supported by CONTEXT. Every substantive claim, formula, number, name, rule, step,
+  and conclusion in the output must be recoverable from CONTEXT without outside knowledge.
+- Prefer extractive or tightly reconstructive tasks over speculative completion. If a procedure, argument,
+  analysis, or explanation is only partly present, ask for the stated fragment or a supported consequence,
+  not a completed version invented from general knowledge.
+- If a TARGET is provided, test that target while using the rest only as the surrounding haystack.
+- The instruction must establish every entity and fact needed to understand and answer it without seeing CONTEXT.
+- For translation, simplification, summarization, rewriting, classification, or extraction tasks, embed the exact
+  target passage or data inside the instruction. If embedding it is unnecessary, reformulate the task around a
+  named proposition, rule, event, or subject. Never ask the user to act on an unseen paragraph, excerpt, record,
+  document, image, table, or code sample.
+- On first mention, introduce a generalized entity with an indefinite role or type, such as "a tenant",
+  "an API client", "a chemical compound", or "a financial institution".
+- Write the task as a reusable scenario, not as commentary about one source instance. Refer back with a meaningful
+  role, noun, or fact.
+- In both returned fields, use no demonstrative determiner ("this", "that", "these", or "those") for an entity,
+  event, case, document, study, function, condition, result, or scenario derived from CONTEXT.
+- Make the final request name the actual subject of the task. For example:
+  - "What management is appropriate for recurrent bradycardia?" rather than "What should be done for this patient?"
+  - "What legal rule applies when a tenant breaks the lease?" rather than "What did this case establish?"
+  - "How should a function that returns a null value be fixed?" rather than "How should this function be fixed?"
+  - "State the formula for the differential of f at a" rather than "Explain what the text says about derivatives."
+- Write the answer as a direct, reusable statement about the named subject, principle, process, or result.
+- Keep both fields self-contained: do not refer to unseen source material via provenance cues (source title,
+  section/chapter/heading labels, "according to …", "based on the …", "as described in …", "the text above",
+  or "the provided/given material"). Ask about the named subject directly — the training pair will not include
+  the source.
+- Make the example transferable by removing incidental identity and provenance details that do not affect the answer.
+- Preserve names, identifiers, dates, numbers, quotations, formulas, and terminology when they are necessary for
+  correctness.
+- Apply the variation profile only when it preserves truth. Never widen a number, replace a named entity, or remove
+  an attribute when doing so would alter the answer.
+- The output should state the answer using the named subject, principle, process, formula, or result rather than a
+  generic reference back to the source scenario.
+- Do not ask for citations or line numbers unless they exist in the context.
+- Keep the answer direct but complete.
+- If you cannot form a fully CONTEXT-supported answer for this persona and chunk, choose a narrower supported task
+  instead of guessing.
+
+Cross-domain rewrite examples (illustrations only — rotate among shapes; never lock onto one):
+- Medical: "What findings suggest Y?", "Explain the mechanism of Z", "Which conditions are in the differential for X?",
+  "What complication is associated with X?", "When is treatment A contraindicated for X?"
+- Legal: "What did this case establish?" becomes "Explain the rule that applies when a landlord retains a deposit."
+  The answer begins "The applicable rule is...", not "This case established..."
+- Software: "Why does this function fail?" becomes "Tell me why a parser fails when input ends with a delimiter."
+  The answer begins "The parser fails because...", not "This function fails because..."
+- Math: "What does the text say about derivatives?" becomes "State the relationship between the differential of f
+  at a and f'(a)." The answer should include the formula when CONTEXT provides it.
+- Research: "What do these results show?" becomes "Describe the relationship between the measured variables."
+  The answer names the relationship directly.
+
+Before returning:
+1. Silently draft a grounded task that matches the assigned task focus when possible.
+2. Confirm every answer claim is present in or directly entailed by CONTEXT; otherwise narrow the task.
+3. Rewrite into a reusable, referentially closed pair with no provenance cues or demonstratives.
+4. Silently scan both fields for source-references and rewrite any that remain.
+5. Verify that every substantive claim remains grounded in CONTEXT.
+6. If CONTEXT contains formulas, holdings, criteria, code, or other profile assets, check that the pair uses them
+   when relevant instead of only paraphrasing surrounding prose.
+7. Reject drafts that ignore the assigned task focus just to reuse a familiar domain stem.
+
+Return:
+{{"instruction": "...", "output": "...", "standalone": true}}
+
+HEADER:
+{header}
+
+TARGET:
+{chunk.target_text}
+
+CONTEXT:
+{chunk.text}
+"""
+    value = _retry_json(
+        backend,
+        _PAIR_SYSTEM,
+        prompt,
+        max_new_tokens=900,
+        attempts=3,
+        enable_thinking=False,
+    )
+    if not isinstance(value, dict):
+        raise ValueError("Q&A response must be a JSON object")
+    pair = GeneratedPair.from_dict(value)
+    if require_standalone and not pair.standalone:
+        raise ValueError("Model did not generate a standalone instruction")
+    return pair
+
+
+def verify_pair_grounding(
+    backend: InferenceBackend,
+    *,
+    chunk_text: str,
+    instruction: str,
+    output: str,
+) -> dict[str, Any]:
+    prompt = f"""Decide whether OUTPUT is fully grounded in CONTEXT for the given INSTRUCTION.
+Use only CONTEXT. Do not reward answers that are merely plausible from general knowledge.
+Mark grounded=false if OUTPUT adds any substantive fact, number, formula, step, name, rule, diagnosis,
+holding, code behavior, or conclusion that CONTEXT does not support.
+Paraphrase is allowed. Invention is not.
+If the instruction asks for more than CONTEXT can support, mark grounded=false.
+Critical case: if CONTEXT mainly contains unanswered questions or prompts without the supporting facts,
+procedure, ruling, result, or explanation, and OUTPUT tries to answer them anyway, mark grounded=false.
+The model must not fill in answers from outside knowledge when CONTEXT only asked the question.
+When grounded=true, quote the exact supporting passages from CONTEXT in supporting_excerpts. Prefer short
+verbatim excerpts over paraphrase. Include every passage needed to justify OUTPUT.
+
+Return only:
+{{
+  "grounded": true,
+  "supporting_excerpts": ["verbatim excerpt from CONTEXT that supports the output"],
+  "unsupported_claims": ["optional short claim not supported by CONTEXT"],
+  "reason": "one short sentence"
+}}
+
+INSTRUCTION:
+{instruction}
+
+OUTPUT:
+{output}
+
+CONTEXT:
+{chunk_text}
+"""
+    value = _retry_json(backend, _GROUNDING_SYSTEM, prompt, max_new_tokens=500)
+    if not isinstance(value, dict) or not isinstance(value.get("grounded"), bool):
+        raise ValueError("Grounding response must include boolean grounded")
+    unsupported = value.get("unsupported_claims", [])
+    if unsupported is None:
+        unsupported = []
+    if not isinstance(unsupported, list):
+        raise ValueError("unsupported_claims must be a list")
+    supporting = value.get("supporting_excerpts", [])
+    if supporting is None:
+        supporting = []
+    if not isinstance(supporting, list):
+        raise ValueError("supporting_excerpts must be a list")
+    reason = value.get("reason", "")
+    if not isinstance(reason, str):
+        reason = ""
+    return {
+        "grounded": value["grounded"],
+        "supporting_excerpts": [str(item).strip() for item in supporting if str(item).strip()],
+        "unsupported_claims": [str(item) for item in unsupported if str(item).strip()],
+        "reason": reason.strip(),
+    }
+
+
+def generate_grounded_pair(
+    backend: InferenceBackend,
+    persona: Persona,
+    tree: DocumentTree,
+    *,
+    header_prefix: str,
+    summary: str,
+    rng: random.Random,
+    dataset_profile: DatasetProfile | None = None,
+    max_attempts: int = 5,
+    verify_grounding: bool = True,
+    assigned_chunk: SampledChunk | None = None,
+    chunk_pool: list[SampledChunk] | None = None,
+    pool_index: int = 0,
+    task_focus: str | None = None,
+    form_index: int | None = None,
+    deduper: InstructionDeduper | None = None,
+) -> tuple[SampledChunk, GeneratedPair, dict[str, Any], dict[str, str], str]:
+    """Generate a pair from a pre-assigned chunk (with ordered fallbacks).
+
+    When verify_grounding is True, an extra LLM call checks CONTEXT support and
+    rejects ungrounded answers. Grounding details are not written into the training dataset.
+    """
+    last_error: Exception | None = None
+    # Do not copy the full pool list — iterate the shared reference.
+    pool = chunk_pool if chunk_pool is not None else list_candidate_chunks(tree, persona)
+    if not pool and assigned_chunk is None:
+        raise ValueError("No candidate chunks available")
+
+    ordered: list[SampledChunk] = []
+    if assigned_chunk is not None:
+        ordered.append(assigned_chunk)
+    if pool:
+        start = pool_index % len(pool)
+        for offset in range(len(pool)):
+            candidate = pool[(start + offset) % len(pool)]
+            if assigned_chunk is not None and candidate is assigned_chunk:
+                continue
+            if assigned_chunk is not None and (
+                candidate.start == assigned_chunk.start
+                and candidate.end == assigned_chunk.end
+                and candidate.section_path == assigned_chunk.section_path
+            ):
+                continue
+            ordered.append(candidate)
+    if not ordered:
+        ordered = list(pool)
+
+    for attempt_i, chunk in enumerate(ordered[:max_attempts]):
+        if is_prompt_only_chunk(chunk.text):
+            last_error = ValueError("Sampled chunk is prompt-only without answerable source material")
+            continue
+        header = f"{header_prefix}{chunk.section_path}\nDocument summary: {summary}"
+        augmentation = sample_pair_augmentation(
+            rng,
+            task_focus=task_focus,
+            form_index=(form_index + attempt_i) if form_index is not None else None,
+        )
+        try:
+            pair = generate_pair(
+                backend,
+                persona,
+                chunk,
+                header,
+                require_standalone=True,
+                augmentation=augmentation,
+                dataset_profile=dataset_profile,
+            )
+        except Exception as exc:  # noqa: BLE001 - retry across chunk/pair attempts
+            last_error = exc
+            continue
+        if instruction_cites_source_context(pair.instruction):
+            last_error = ValueError("Instruction cites unseen source provenance")
+            continue
+        if deduper is not None and not deduper.try_claim(pair.instruction):
+            last_error = ValueError("Duplicate, near-duplicate, or overused instruction stem rejected")
+            continue
+        if not verify_grounding:
+            return (
+                chunk,
+                pair,
+                {
+                    "grounded": None,
+                    "supporting_excerpts": [],
+                    "unsupported_claims": [],
+                    "reason": "grounding check skipped",
+                },
+                augmentation,
+                header,
+            )
+        try:
+            grounding = verify_pair_grounding(
+                backend,
+                chunk_text=chunk.text,
+                instruction=pair.instruction,
+                output=pair.output,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+        if grounding["grounded"]:
+            return chunk, pair, grounding, augmentation, header
+        last_error = ValueError(
+            "Generated pair failed grounding check: "
+            + (grounding["reason"] or ", ".join(grounding["unsupported_claims"]) or "unsupported claims")
+        )
+    raise last_error or ValueError("Failed to generate a grounded pair")
+
+
+def _existing_doc_ids(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    ids = set()
+    with path.open() as handle:
+        for line in handle:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value.get("doc_id"), str):
+                ids.add(value["doc_id"])
+    return ids
+
+
+def _existing_doc_record_counts(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    counts: dict[str, int] = {}
+    with path.open() as handle:
+        for line in handle:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            doc_id = value.get("doc_id")
+            if isinstance(doc_id, str):
+                counts[doc_id] = counts.get(doc_id, 0) + 1
+    return counts
+
+
+def _existing_doc_personas(path: Path) -> set[tuple[str, str]]:
+    if not path.exists():
+        return set()
+    pairs = set()
+    with path.open() as handle:
+        for line in handle:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            persona = value.get("persona")
+            if (
+                isinstance(value.get("doc_id"), str)
+                and isinstance(persona, dict)
+                and isinstance(persona.get("name"), str)
+            ):
+                pairs.add((value["doc_id"], persona["name"].casefold()))
+    return pairs
+
+
+def _append_jsonl(path: Path, value: dict[str, Any], *, lock: threading.Lock | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(value, ensure_ascii=False, default=str) + "\n"
+    if lock is None:
+        with path.open("a") as handle:
+            handle.write(line)
+        return
+    with lock:
+        with path.open("a") as handle:
+            handle.write(line)
+
+
+def _build_example_record(
+    backend: InferenceBackend,
+    *,
+    document: SourceDocument,
+    persona: Persona,
+    tree: DocumentTree,
+    summary: str,
+    rng: random.Random,
+    dataset_id: str,
+    dataset_profile: DatasetProfile | None,
+    seed: int,
+    verify_grounding: bool = True,
+    resolve_references: bool = False,
+    assigned_chunk: SampledChunk | None = None,
+    chunk_pool: list[SampledChunk] | None = None,
+    pool_index: int = 0,
+    task_focus: str | None = None,
+    form_index: int | None = None,
+    deduper: InstructionDeduper | None = None,
+) -> dict[str, Any]:
+    chunk, pair, grounding, augmentation, header = generate_grounded_pair(
+        backend,
+        persona,
+        tree,
+        header_prefix=f"{document.title} > ",
+        summary=summary,
+        rng=rng,
+        dataset_profile=dataset_profile,
+        verify_grounding=verify_grounding,
+        assigned_chunk=assigned_chunk,
+        chunk_pool=chunk_pool,
+        pool_index=pool_index,
+        task_focus=task_focus,
+        form_index=form_index,
+        deduper=deduper,
+    )
+    context = f"{header}\n\n{chunk.text}"
+    token_counter = getattr(backend, "count_tokens", None)
+    tokens = token_counter(context) if callable(token_counter) else max(1, len(context) // 4)
+
+    reference_excerpts: list[dict[str, Any]] = []
+    output_with_references = pair.output
+    if resolve_references:
+        # Cheap regex gate: only pay for an LLM resolve call when the answer
+        # (or instruction) actually cites sections/clauses/etc.
+        citations = extract_reference_mentions(f"{pair.instruction}\n{pair.output}")
+        if citations:
+            reference_excerpts = resolve_reference_excerpts(
+                backend,
+                tree,
+                pair.instruction,
+                pair.output,
+                preferred_text=chunk.text,
+            )
+            output_with_references = format_output_with_reference_context(
+                pair.output,
+                reference_excerpts,
+            )
+
+    # Training projection only needs instruct/output; keep a slim operational record.
+    record: dict[str, Any] = {
+        "persona": persona.to_dict(),
+        "instruction": pair.instruction,
+        "output": pair.output,
+        "dataset_id": dataset_id,
+        "doc_id": document.doc_id,
+        "doc_title": document.title,
+        "section_path": chunk.section_path,
+        "level": chunk.level,
+        "method": chunk.method,
+        "tokens": tokens,
+        "model": backend.model_name,
+        "standalone": pair.standalone,
+        "decontextualized": True,
+        "augmentation": augmentation,
+        "seed": seed,
+        "grounded": grounding.get("grounded"),
+    }
+    if resolve_references:
+        record["reference_excerpts"] = reference_excerpts
+        record["output_with_references"] = output_with_references
+        record["context"] = context
+        record["source_chunk"] = chunk.text
+        record["target_text"] = chunk.target_text
+        record["document_summary"] = summary
+        record["dataset_profile"] = dataset_profile.to_dict() if dataset_profile else None
+        record["source_metadata"] = document.metadata
+        record["header"] = header
+        record["offsets"] = {"start": chunk.start, "end": chunk.end, "basis": "cleaned_text"}
+        record["grounding"] = grounding
+    return record
+
+
+def _persona_slug(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().casefold()).strip("-")
+    return slug or "persona"
+
+
+def _persona_train_path(output_dir: Path, persona_name: str) -> Path:
+    return output_dir / "god_train" / f"{_persona_slug(persona_name)}.jsonl"
+
+
+def _write_example_outputs(
+    record: dict[str, Any],
+    *,
+    records_path: Path,
+    review_path: Path | None,
+    train_dir: Path,
+    lock: threading.Lock,
+) -> None:
+    persona_name = ""
+    persona = record.get("persona")
+    if isinstance(persona, dict) and isinstance(persona.get("name"), str):
+        persona_name = persona["name"]
+    train_path = train_dir / f"{_persona_slug(persona_name)}.jsonl"
+    train_output = record.get("output_with_references") or record["output"]
+    _append_jsonl(records_path, record, lock=lock)
+    _append_jsonl(train_path, {"instruct": record["instruction"], "output": train_output}, lock=lock)
+    if review_path is None:
+        return
+    _append_jsonl(
+        review_path,
+        {
+            "persona": record["persona"],
+            "generated": {
+                "instruction": record["instruction"],
+                "output": record["output"],
+                "output_with_references": record.get("output_with_references") or record["output"],
+            },
+            "reference_excerpts": record.get("reference_excerpts") or [],
+            "augmentation": record.get("augmentation"),
+            "grounding": record.get("grounding"),
+            "dataset_profile": record.get("dataset_profile"),
+            "source": {
+                "dataset_id": record.get("dataset_id"),
+                "doc_id": record.get("doc_id"),
+                "doc_title": record.get("doc_title"),
+                "document_summary": record.get("document_summary"),
+                "section_path": record.get("section_path"),
+                "chunk": record.get("source_chunk"),
+                "target_text": record.get("target_text"),
+                "offsets": record.get("offsets"),
+            },
+        },
+        lock=lock,
+    )
+
+
+def estimate_generation_capacity(
+    tree: DocumentTree,
+    personas: list[Persona],
+    *,
+    dataset_profile: DatasetProfile | None = None,
+    angle_passes: int | None = None,
+) -> tuple[int, dict[str, int]]:
+    """Honest upper bound: every persona × full chunk pool × angle passes."""
+    profile_tasks = dataset_profile.preferred_task_types if dataset_profile is not None else ()
+    passes = angle_passes if angle_passes is not None else max(1, min(4, len(profile_tasks) or 3))
+    pool_sizes: dict[str, int] = {}
+    total = 0
+    for persona in personas:
+        try:
+            size = len(list_candidate_chunks(tree, persona))
+        except ValueError:
+            size = 0
+        pool_sizes[persona.name] = size
+        total += size * passes
+    return max(0, total), pool_sizes
+
+
+def run_pipeline(
+    backend: InferenceBackend,
+    documents: list[SourceDocument],
+    personas: list[Persona],
+    output_dir: Path,
+    *,
+    dataset_id: str,
+    examples_per_doc: int = 3,
+    seed: int = 42,
+    resume: bool = True,
+    all_personas_per_doc: bool = False,
+    dataset_profile: DatasetProfile | None = None,
+    workers: int = 1,
+    verify_grounding: bool = True,
+    resolve_references: bool = False,
+    write_review: bool = False,
+    persona_quotas: dict[str, int] | None = None,
+    target_rows: int | None = None,
+    sample_mode: str = "auto",
+    on_progress: Callable[[str, dict[str, Any] | None], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> dict[str, int]:
+    """Generate rows from native chunk pools with random subsample when partial.
+
+    ``target_rows`` is the combined accept target. When below capacity, chunks are
+    randomly subsampled (shared paragraph anchors for multi-persona jobs by
+    default). Chunk units stay at each persona's native level — never enlarged.
+    ``persona_quotas`` is ignored (kept for call-site compatibility).
+    """
+    del persona_quotas  # random subsample / full-pool coverage replaces quota slicing
+    records_path = output_dir / "records.jsonl"
+    review_path = (output_dir / "review.jsonl") if write_review else None
+    train_dir = output_dir / "god_train"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    failures_path = output_dir / "failures.jsonl"
+    completed_pairs = _existing_doc_personas(records_path) if resume and all_personas_per_doc else set()
+    existing_counts = _existing_doc_record_counts(records_path) if resume else {}
+    counts = {"documents": 0, "records": 0, "failures": 0, "skipped": 0}
+    write_lock = threading.Lock()
+    accept_lock = threading.Lock()
+    worker_count = max(1, workers)
+    deduper = InstructionDeduper(store_path=output_dir / "dedupe.db")
+    goal = max(1, int(target_rows or examples_per_doc or 1))
+    progress_every = max(1, min(50, goal // 20 or 1))
+    last_reported = 0
+
+    def _ensure_not_cancelled() -> None:
+        if is_cancelled is not None and is_cancelled():
+            raise StructureJobCancelled("cancelled by user")
+
+    def _emit(message: str, *, error: bool = False) -> None:
+        _ensure_not_cancelled()
+        if on_progress is None:
+            return
+        payload = {
+            "stage": "generate",
+            "goal": goal,
+            "documents": counts["documents"],
+            "records": counts["records"],
+            "failures": counts["failures"],
+            "skipped": counts["skipped"],
+        }
+        if error:
+            on_progress(f"error: {message}", payload)
+        else:
+            on_progress(message, payload)
+
+    for document in documents:
+        if counts["records"] >= goal:
+            break
+        if all_personas_per_doc and all(
+            (document.doc_id, persona.name.casefold()) in completed_pairs for persona in personas
+        ):
+            counts["skipped"] += 1
+            continue
+        if not all_personas_per_doc and existing_counts.get(document.doc_id, 0) >= examples_per_doc:
+            counts["skipped"] += 1
+            continue
+        try:
+            _emit(f"parsing document {document.doc_id}")
+            tree = parse_document(document)
+            summary = summarize_document(backend, tree, workers=worker_count)
+            if not tree.sections:
+                raise ValueError("No useful prose remained after filtering")
+            counts["documents"] += 1
+
+            active_personas = [
+                persona
+                for persona in personas
+                if (document.doc_id, persona.name.casefold()) not in completed_pairs
+            ] or list(personas)
+
+            pools: dict[str, list[SampledChunk]] = {}
+            for persona in active_personas:
+                try:
+                    pools[persona.name] = list_candidate_chunks(tree, persona)
+                except ValueError:
+                    pools[persona.name] = []
+
+            profile_tasks = (
+                list(dataset_profile.preferred_task_types) if dataset_profile is not None else []
+            )
+            if not profile_tasks:
+                profile_tasks = list(DEFAULT_TASK_FOCUSES)
+
+            work = build_generation_work(
+                tree,
+                active_personas,
+                pools,
+                goal=goal - counts["records"],
+                profile_tasks=profile_tasks,
+                seed=seed ^ (hash(document.doc_id) & 0xFFFFFFFF),
+                sample_mode=sample_mode,
+            )
+            if not work:
+                raise ValueError("No usable chunks for any persona")
+            work_index = output_dir / "work_index.jsonl"
+            with work_index.open("a", encoding="utf-8") as handle:
+                for index, persona, chunk, pool_index, task_focus in work:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "doc_id": document.doc_id,
+                                "index": index,
+                                "persona": persona.name,
+                                "pool_index": pool_index,
+                                "task_focus": task_focus,
+                                "start": chunk.start,
+                                "end": chunk.end,
+                            }
+                        )
+                        + "\n"
+                    )
+            _emit(f"generating from {document.doc_id}: {len(work)} chunk tasks queued")
+
+            stop_flag = threading.Event()
+
+            def _report_accept() -> None:
+                nonlocal last_reported
+                if (
+                    counts["records"] == goal
+                    or counts["records"] - last_reported >= progress_every
+                    or counts["records"] <= 5
+                ):
+                    last_reported = counts["records"]
+                    _emit(f"accepted {counts['records']}/{goal} rows ({counts['failures']} failures)")
+
+            def _run_one(
+                index: int,
+                persona: Persona,
+                chunk: SampledChunk,
+                pool_index: int,
+                task_focus: str,
+            ) -> bool:
+                _ensure_not_cancelled()
+                if stop_flag.is_set():
+                    return False
+                with accept_lock:
+                    if counts["records"] >= goal:
+                        stop_flag.set()
+                        return False
+                local_rng = random.Random((seed + 1_000_003 * index) ^ (hash(document.doc_id) & 0xFFFFFFFF))
+                record = _build_example_record(
+                    backend,
+                    document=document,
+                    persona=persona,
+                    tree=tree,
+                    summary=summary,
+                    rng=local_rng,
+                    dataset_id=dataset_id,
+                    dataset_profile=dataset_profile,
+                    seed=seed,
+                    verify_grounding=verify_grounding,
+                    resolve_references=resolve_references,
+                    assigned_chunk=chunk,
+                    chunk_pool=pools.get(persona.name) or [chunk],
+                    pool_index=pool_index,
+                    task_focus=task_focus,
+                    form_index=index,
+                    deduper=deduper,
+                )
+                with accept_lock:
+                    if counts["records"] >= goal:
+                        stop_flag.set()
+                        return False
+                    _write_example_outputs(
+                        record,
+                        records_path=records_path,
+                        review_path=review_path,
+                        train_dir=train_dir,
+                        lock=write_lock,
+                    )
+                    counts["records"] += 1
+                    _report_accept()
+                    if counts["records"] >= goal:
+                        stop_flag.set()
+                    return True
+
+            if worker_count <= 1 or len(work) <= 1:
+                for index, persona, chunk, pool_index, task_focus in work:
+                    if stop_flag.is_set() or counts["records"] >= goal:
+                        break
+                    try:
+                        _run_one(index, persona, chunk, pool_index, task_focus)
+                    except StructureJobCancelled:
+                        raise
+                    except Exception as exc:
+                        _append_jsonl(
+                            failures_path,
+                            {
+                                "dataset_id": dataset_id,
+                                "doc_id": document.doc_id,
+                                "persona": persona.name,
+                                "error": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                            lock=write_lock,
+                        )
+                        with accept_lock:
+                            counts["failures"] += 1
+                        _emit(f"{type(exc).__name__} on {persona.name}/{document.doc_id}: {exc}", error=True)
+            else:
+                # Keep only worker_count futures in flight — submitting the full
+                # 20k-item queue at once OOMs small pods.
+                max_inflight = min(worker_count, len(work))
+                with ThreadPoolExecutor(max_workers=max_inflight) as pool:
+                    work_iter = iter(work)
+                    futures: dict[Any, Persona] = {}
+                    pending: set[Any] = set()
+
+                    def _submit_one() -> bool:
+                        try:
+                            index, persona, chunk, pool_index, task_focus = next(work_iter)
+                        except StopIteration:
+                            return False
+                        fut = pool.submit(_run_one, index, persona, chunk, pool_index, task_focus)
+                        futures[fut] = persona
+                        pending.add(fut)
+                        return True
+
+                    while len(pending) < max_inflight and _submit_one():
+                        pass
+
+                    while pending:
+                        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            persona = futures.pop(future)
+                            try:
+                                future.result()
+                            except StructureJobCancelled:
+                                stop_flag.set()
+                                for leftover in pending:
+                                    leftover.cancel()
+                                raise
+                            except Exception as exc:
+                                _append_jsonl(
+                                    failures_path,
+                                    {
+                                        "dataset_id": dataset_id,
+                                        "doc_id": document.doc_id,
+                                        "persona": persona.name,
+                                        "error": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                    lock=write_lock,
+                                )
+                                with accept_lock:
+                                    counts["failures"] += 1
+                                _emit(
+                                    f"{type(exc).__name__} on {persona.name}/{document.doc_id}: {exc}",
+                                    error=True,
+                                )
+                            if stop_flag.is_set() or counts["records"] >= goal:
+                                stop_flag.set()
+                                for leftover in pending:
+                                    leftover.cancel()
+                                pending.clear()
+                                break
+                            _submit_one()
+
+        except StructureJobCancelled:
+            raise
+        except Exception as exc:
+            _append_jsonl(
+                failures_path,
+                {"dataset_id": dataset_id, "doc_id": document.doc_id, "error": type(exc).__name__, "message": str(exc)},
+                lock=write_lock,
+            )
+            counts["failures"] += 1
+            _emit(f"{type(exc).__name__} on document {document.doc_id}: {exc}", error=True)
+
+    deduper.close()
+    return counts
