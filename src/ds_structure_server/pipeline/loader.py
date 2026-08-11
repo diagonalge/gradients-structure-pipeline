@@ -455,9 +455,15 @@ def _ocr_pdf(
     dpi: int = _DEFAULT_OCR_DPI,
     max_pages: int = _DEFAULT_OCR_MAX_PAGES,
 ) -> str:
-    import pytesseract
-    from pdf2image import convert_from_path
-    from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError
+    try:
+        import pytesseract
+        from pdf2image import convert_from_path
+        from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError
+    except ImportError as exc:
+        raise RuntimeError(
+            "OCR fallback requires optional deps: pip install 'ds-structure-server[ocr]' "
+            f"(pytesseract + pdf2image). Missing while reading: {path}"
+        ) from exc
 
     try:
         images = convert_from_path(

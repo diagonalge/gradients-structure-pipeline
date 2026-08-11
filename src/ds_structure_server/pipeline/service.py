@@ -728,7 +728,11 @@ def run_structure_job(
     save_personas(output_dir / "personas.json", personas)
     progress(
         f"using {len(personas)} persona(s): {', '.join(p.name for p in personas)}",
-        {"stage": "profile", "goal": config.num_rows, "personas": [p.name for p in personas]},
+        {
+            "stage": "profile",
+            "goal": config.num_rows,
+            "personas": [p.to_dict() for p in personas],
+        },
     )
 
     progress(

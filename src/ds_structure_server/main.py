@@ -28,6 +28,21 @@ app = FastAPI(
 )
 
 
+def _normalize_personas(raw: Any) -> list[dict[str, Any]] | None:
+    """Accept full persona dicts or legacy name strings from progress updates."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            out.append(item)
+        elif isinstance(item, str) and item.strip():
+            out.append({"name": item.strip()})
+    return out
+
+
 def _to_status_response(job_id: uuid.UUID, payload: dict[str, Any]) -> JobStatusResponse:
     counts = {
         k: payload.get(k)
@@ -42,7 +57,7 @@ def _to_status_response(job_id: uuid.UUID, payload: dict[str, Any]) -> JobStatus
         source=payload.get("source"),
         num_rows=payload.get("num_rows"),
         chunk_level=payload.get("chunk_level"),
-        personas=payload.get("personas"),
+        personas=_normalize_personas(payload.get("personas")),
         counts=counts,
         dataset_urls=payload.get("dataset_urls"),
         error=payload.get("error"),
