@@ -9,6 +9,7 @@ import random
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -411,17 +412,19 @@ _STRUCTURED_SUFFIXES = {".json", ".jsonl", ".csv"}
 _ARCHIVE_SUFFIXES = {".zip"}
 _MIN_PDF_CHARS_PER_PAGE = 40
 _MIN_PDF_NONEMPTY_PAGE_RATIO = 0.2
-# Keep OCR / PDF / document loads memory-bounded (small hosts ~4GiB).
-_DEFAULT_OCR_DPI = int(os.getenv("STRUCTURE_OCR_DPI", "150"))
-_DEFAULT_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_OCR_MAX_PAGES", "40"))
-_DEFAULT_NATIVE_PDF_MAX_PAGES = int(os.getenv("STRUCTURE_PDF_MAX_PAGES", "80"))
-_MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_MAX_DOCUMENT_CHARS", "500000"))
-_MAX_STRUCTURED_FILE_BYTES = int(os.getenv("STRUCTURE_MAX_STRUCTURED_FILE_BYTES", str(32 * 1024 * 1024)))
-_MAX_ZIP_UNCOMPRESSED_BYTES = int(os.getenv("STRUCTURE_MAX_ZIP_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
-# Suggest/discovery: fewer OCR pages + lower DPI — personas only need a skim.
+# Defaults sized for a ~16 vCPU / 16 GiB structure worker.
+# 0 for page/char caps means "no limit" (process the full document).
+_DEFAULT_OCR_DPI = int(os.getenv("STRUCTURE_OCR_DPI", "120"))
+_DEFAULT_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_OCR_MAX_PAGES", "0"))
+_DEFAULT_OCR_WORKERS = max(1, int(os.getenv("STRUCTURE_OCR_WORKERS", "8")))
+_DEFAULT_NATIVE_PDF_MAX_PAGES = int(os.getenv("STRUCTURE_PDF_MAX_PAGES", "0"))
+_MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_MAX_DOCUMENT_CHARS", "0"))
+_MAX_STRUCTURED_FILE_BYTES = int(os.getenv("STRUCTURE_MAX_STRUCTURED_FILE_BYTES", str(128 * 1024 * 1024)))
+_MAX_ZIP_UNCOMPRESSED_BYTES = int(os.getenv("STRUCTURE_MAX_ZIP_UNCOMPRESSED_BYTES", str(512 * 1024 * 1024)))
+# Suggest may still skim lighter; 0 = full document (same as generate on 16 GiB hosts).
 _SUGGEST_OCR_DPI = int(os.getenv("STRUCTURE_SUGGEST_OCR_DPI", "120"))
-_SUGGEST_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_SUGGEST_OCR_MAX_PAGES", "8"))
-_SUGGEST_MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_SUGGEST_MAX_DOCUMENT_CHARS", "120000"))
+_SUGGEST_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_SUGGEST_OCR_MAX_PAGES", "0"))
+_SUGGEST_MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_SUGGEST_MAX_DOCUMENT_CHARS", "0"))
 _LIGHT_DOCUMENT_MODE: ContextVar[bool] = ContextVar("structure_light_document_mode", default=False)
 
 
@@ -474,8 +477,8 @@ def _normalize_extracted_text(text: str) -> str:
 
 def _truncate_chars(text: str, limit: int = _MAX_DOCUMENT_CHARS) -> str:
     cap = limit
-    if _in_light_document_mode():
-        cap = min(cap, _SUGGEST_MAX_DOCUMENT_CHARS)
+    if _in_light_document_mode() and _SUGGEST_MAX_DOCUMENT_CHARS > 0:
+        cap = min(cap, _SUGGEST_MAX_DOCUMENT_CHARS) if cap > 0 else _SUGGEST_MAX_DOCUMENT_CHARS
     if cap <= 0 or len(text) <= cap:
         return text
     return text[:cap]
@@ -490,8 +493,16 @@ def _pdf_native_text(
     from pypdf import PdfReader
 
     if _in_light_document_mode():
-        max_pages = min(max_pages, _SUGGEST_OCR_MAX_PAGES * 2) if max_pages > 0 else _SUGGEST_OCR_MAX_PAGES * 2
-        max_chars = min(max_chars, _SUGGEST_MAX_DOCUMENT_CHARS)
+        if _SUGGEST_OCR_MAX_PAGES > 0:
+            max_pages = (
+                min(max_pages, _SUGGEST_OCR_MAX_PAGES) if max_pages > 0 else _SUGGEST_OCR_MAX_PAGES
+            )
+        if _SUGGEST_MAX_DOCUMENT_CHARS > 0:
+            max_chars = (
+                min(max_chars, _SUGGEST_MAX_DOCUMENT_CHARS)
+                if max_chars > 0
+                else _SUGGEST_MAX_DOCUMENT_CHARS
+            )
     reader = PdfReader(path)
     total_pages = len(reader.pages)
     limit = total_pages if max_pages <= 0 else min(total_pages, max_pages)
@@ -523,18 +534,57 @@ def _pdf_text_is_usable(text: str, page_count: int) -> bool:
     return chars_per_page >= _MIN_PDF_CHARS_PER_PAGE and nonempty_ratio >= _MIN_PDF_NONEMPTY_PAGE_RATIO
 
 
+def _pdf_page_count(path: Path) -> int:
+    from pypdf import PdfReader
+
+    return len(PdfReader(path).pages)
+
+
+def _ocr_one_page(
+    path: Path,
+    page_num: int,
+    *,
+    dpi: int,
+) -> tuple[int, str]:
+    """Render + OCR a single page; release the image before returning."""
+    import pytesseract
+    from pdf2image import convert_from_path
+
+    images = convert_from_path(
+        str(path),
+        dpi=dpi,
+        first_page=page_num,
+        last_page=page_num,
+        grayscale=True,
+        thread_count=1,
+    )
+    if not images:
+        return page_num, ""
+    image = images[0]
+    try:
+        raw = pytesseract.image_to_string(image)
+    finally:
+        image.close()
+        del images
+    return page_num, _normalize_extracted_text(raw)
+
+
 def _ocr_pdf(
     path: Path,
     *,
     dpi: int = _DEFAULT_OCR_DPI,
     max_pages: int = _DEFAULT_OCR_MAX_PAGES,
+    workers: int = _DEFAULT_OCR_WORKERS,
 ) -> str:
     if _in_light_document_mode():
         dpi = min(dpi, _SUGGEST_OCR_DPI)
-        max_pages = min(max_pages, _SUGGEST_OCR_MAX_PAGES) if max_pages > 0 else _SUGGEST_OCR_MAX_PAGES
+        if _SUGGEST_OCR_MAX_PAGES > 0:
+            max_pages = (
+                min(max_pages, _SUGGEST_OCR_MAX_PAGES) if max_pages > 0 else _SUGGEST_OCR_MAX_PAGES
+            )
     try:
         import pytesseract
-        from pdf2image import convert_from_path
+        from pdf2image import convert_from_path  # noqa: F401 — import check
         from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError
     except ImportError as exc:
         raise RuntimeError(
@@ -542,52 +592,69 @@ def _ocr_pdf(
             f"(pytesseract + pdf2image). Missing while reading: {path}"
         ) from exc
 
-    # Render + OCR one page at a time so peak RSS stays roughly constant.
-    page_texts: list[str] = []
-    last_page = max_pages if max_pages > 0 else None
-    page_num = 1
-    logger.info("ocr: start file={} dpi={} max_pages={}", path.name, dpi, max_pages)
-    while last_page is None or page_num <= last_page:
+    try:
+        total_pages = _pdf_page_count(path)
+    except Exception as exc:
+        raise RuntimeError(f"Could not read PDF page count for OCR: {path}") from exc
+    if total_pages <= 0:
+        return ""
+    last_page = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+    page_numbers = list(range(1, last_page + 1))
+    worker_count = max(1, min(workers, len(page_numbers)))
+    logger.info(
+        "ocr: start file={} dpi={} pages={}/{} workers={}",
+        path.name,
+        dpi,
+        last_page,
+        total_pages,
+        worker_count,
+    )
+
+    results: dict[int, str] = {}
+    done = 0
+
+    def _run(page_num: int) -> tuple[int, str]:
         try:
-            images = convert_from_path(
-                str(path),
-                dpi=dpi,
-                first_page=page_num,
-                last_page=page_num,
-                grayscale=True,
-                thread_count=1,
-            )
+            return _ocr_one_page(path, page_num, dpi=dpi)
+        except pytesseract.TesseractNotFoundError as exc:
+            raise RuntimeError(
+                f"OCR fallback requires the `tesseract` binary on PATH: {path}"
+            ) from exc
         except (PDFInfoNotInstalledError, PDFPageCountError, OSError) as exc:
-            if page_texts:
-                break
             raise RuntimeError(
                 f"OCR fallback requires poppler (`pdftoppm`) to render PDF pages: {path}"
             ) from exc
-        except MemoryError:
-            break
-        if not images:
-            break
-        image = images[0]
-        try:
-            try:
-                raw = pytesseract.image_to_string(image)
-            except pytesseract.TesseractNotFoundError as exc:
-                raise RuntimeError(
-                    f"OCR fallback requires the `tesseract` binary on PATH: {path}"
-                ) from exc
-            except MemoryError:
-                break
-        finally:
-            image.close()
-            del images
-        normalized = _normalize_extracted_text(raw)
-        if normalized.strip():
-            page_texts.append(normalized)
-        if page_num == 1 or page_num % 5 == 0:
-            logger.info("ocr: page {} done nonempty_pages={}", page_num, len(page_texts))
-        page_num += 1
-    logger.info("ocr: finished pages_attempted={} nonempty={}", page_num - 1, len(page_texts))
-    return "\f".join(page_texts)
+
+    try:
+        if worker_count == 1:
+            for page_num in page_numbers:
+                _, text = _run(page_num)
+                if text.strip():
+                    results[page_num] = text
+                done += 1
+                if done == 1 or done % 10 == 0 or done == last_page:
+                    logger.info("ocr: page {}/{} nonempty={}", done, last_page, len(results))
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                futures = {pool.submit(_run, page_num): page_num for page_num in page_numbers}
+                for future in as_completed(futures):
+                    page_num, text = future.result()
+                    if text.strip():
+                        results[page_num] = text
+                    done += 1
+                    if done == 1 or done % 10 == 0 or done == last_page:
+                        logger.info(
+                            "ocr: progress {}/{} nonempty={}",
+                            done,
+                            last_page,
+                            len(results),
+                        )
+    except MemoryError:
+        logger.warning("ocr: stopped early on MemoryError after {} pages", done)
+
+    ordered = [results[i] for i in sorted(results)]
+    logger.info("ocr: finished pages_attempted={} nonempty={}", done, len(ordered))
+    return "\f".join(ordered)
 
 
 def _read_pdf(path: Path) -> str:
@@ -611,6 +678,11 @@ def _read_document(path: Path) -> str:
     suffix = path.suffix.casefold()
     if suffix == ".pdf":
         return _read_pdf(path)
+    char_cap = _MAX_DOCUMENT_CHARS
+    if _in_light_document_mode() and _SUGGEST_MAX_DOCUMENT_CHARS > 0:
+        char_cap = (
+            min(char_cap, _SUGGEST_MAX_DOCUMENT_CHARS) if char_cap > 0 else _SUGGEST_MAX_DOCUMENT_CHARS
+        )
     if suffix == ".docx":
         from docx import Document
 
@@ -620,20 +692,21 @@ def _read_document(path: Path) -> str:
             text = (paragraph.text or "").strip()
             if not text:
                 continue
-            if used + len(text) + 2 > _MAX_DOCUMENT_CHARS:
-                remaining = _MAX_DOCUMENT_CHARS - used
+            if char_cap > 0 and used + len(text) + 2 > char_cap:
+                remaining = char_cap - used
                 if remaining > 0:
                     parts.append(text[:remaining])
                 break
             parts.append(text)
             used += len(text) + 2
         return "\n\n".join(parts)
-    # Bound plain-text / HTML reads without slurping multi-hundred-MB files.
+    if char_cap <= 0:
+        return path.read_text(encoding="utf-8", errors="replace")
     chunks: list[str] = []
     used = 0
     with path.open("r", encoding="utf-8", errors="replace") as handle:
-        while used < _MAX_DOCUMENT_CHARS:
-            block = handle.read(min(64 * 1024, _MAX_DOCUMENT_CHARS - used))
+        while used < char_cap:
+            block = handle.read(min(64 * 1024, char_cap - used))
             if not block:
                 break
             chunks.append(block)

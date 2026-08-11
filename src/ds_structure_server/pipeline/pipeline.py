@@ -1127,7 +1127,7 @@ def _candidate_lines(text: str) -> list[str]:
 
 
 
-_MAX_CHUNK_POOL = int(os.environ.get("STRUCTURE_MAX_CHUNK_POOL", "1500"))
+_MAX_CHUNK_POOL = int(os.environ.get("STRUCTURE_MAX_CHUNK_POOL", "5000"))
 
 
 def list_candidate_chunks(

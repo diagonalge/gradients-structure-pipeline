@@ -21,12 +21,19 @@ Internal Gradients worker that turns unstructured documents into instruct JSONL 
 
 ## Env
 
+Defaults target a **~16 vCPU / 16 GiB** structure worker (full-document OCR + high LLM concurrency).
+
 ```bash
 STRUCTURE_SERVICE_TOKEN=...          # required shared secret
 STRUCTURE_DATA_DIR=/data/ds-structure
-STRUCTURE_MAX_JOBS=3
+STRUCTURE_MAX_JOBS=4
 OPENROUTER_API_KEY=...
 DS_STRUCTURE_WORKERS=100             # LLM concurrency (default 100)
+STRUCTURE_OCR_WORKERS=8              # parallel page OCR (default 8)
+STRUCTURE_OCR_DPI=120
+STRUCTURE_OCR_MAX_PAGES=0            # 0 = all pages
+STRUCTURE_PDF_MAX_PAGES=0            # 0 = all pages (native text)
+STRUCTURE_SUGGEST_OCR_MAX_PAGES=0    # 0 = full docs on suggest too
 S3_BUCKET_NAME=gradients
 S3_COMPATIBLE_ENDPOINT=...
 S3_COMPATIBLE_ACCESS_KEY=...

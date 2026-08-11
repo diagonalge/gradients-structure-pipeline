@@ -46,9 +46,9 @@ COMBINED_TRAIN_NAME = "dataset.jsonl"
 DEFAULT_GENERIC_PERSONA_NAMES = ["line-analyst", "summarizer", "needle", "detail-researcher"]
 MAX_INFERRED_PERSONAS = 2
 MAX_STRUCTURE_SOURCES = 50
-MAX_STRUCTURE_TOTAL_BYTES = 200 * 1024 * 1024
-# Suggest / create-check only need enough text for capacity — not hundreds of docs.
-SUGGEST_DOC_LIMIT = int(os.getenv("STRUCTURE_SUGGEST_DOC_LIMIT", "32"))
+MAX_STRUCTURE_TOTAL_BYTES = int(os.getenv("STRUCTURE_MAX_TOTAL_BYTES", str(512 * 1024 * 1024)))
+# Suggest / create-check defaults for ~16 vCPU / 16 GiB workers.
+SUGGEST_DOC_LIMIT = int(os.getenv("STRUCTURE_SUGGEST_DOC_LIMIT", "64"))
 # Calibrated from UKSI (~15 pages / ~27k chars → ~524 capacity) → ~50k chars ≈ 1000 rows.
 MIN_STRUCTURE_CHARS = 50_000
 MIN_STRUCTURE_ROWS = 1_000
@@ -103,8 +103,8 @@ class StructureJobConfig:
     id_column: str | None = None
     title_column: str | None = None
     metadata_columns: tuple[str, ...] = ()
-    max_parse_rows: int = 200
-    persona_sample_docs: int = 20
+    max_parse_rows: int = 1_000
+    persona_sample_docs: int = 50
     chunk_level: ChunkLevel | None = None
     model: str = "Qwen/Qwen3-32B-TEE"
     temperature: float = 0.5
@@ -113,7 +113,7 @@ class StructureJobConfig:
     seed: int = 42
     workers: int = field(default_factory=_internal_workers)
     max_input_tokens: int = 16_000
-    shuffle_buffer: int = 256
+    shuffle_buffer: int = 1_000
     schema_sample_rows: int = 32
 
     def resolved_sources(self) -> list[str]:

@@ -23,7 +23,7 @@ from ds_structure_server.pipeline.service import suggest_structure_for_sources
 from ds_structure_server.s3 import upload_file_to_minio
 
 COMBINED_DATASET_KEY = "dataset"
-_MAX_JOBS = max(1, int(os.getenv("STRUCTURE_MAX_JOBS", "3")))
+_MAX_JOBS = max(1, int(os.getenv("STRUCTURE_MAX_JOBS", "4")))
 _JOB_SLOTS = threading.Semaphore(_MAX_JOBS)
 _ACTIVE: set[str] = set()
 _ACTIVE_LOCK = threading.Lock()
