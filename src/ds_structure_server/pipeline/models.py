@@ -70,7 +70,8 @@ class DatasetProfile:
                 f"Avoid: {', '.join(self.avoid) or 'n/a'}",
                 f"Recommended chunk level: {self.recommended_chunk_level or 'persona-default'}",
                 "Diversity: each row should pursue a different supported task when CONTEXT allows; "
-                "never default every row to the same stem (e.g. treatment-only).",
+                "rotate among the preferred task types rather than one familiar stem.",
+                "Shape: write reusable named-subject Q&A; put defining details inside the pair so it stands alone.",
             ]
         )
 

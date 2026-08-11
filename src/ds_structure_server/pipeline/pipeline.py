@@ -144,12 +144,25 @@ Return only valid JSON. Do not include generic assistant personas already suppli
 _EXPAND_PERSONA_SYSTEM = """You turn short role labels into full personas for document-grounded instruction datasets.
 Return only valid JSON."""
 _PAIR_SYSTEM = """You create source-grounded supervised fine-tuning examples.
-Use only the supplied context. Produce referentially closed pairs for which every entity is established in the
-instruction. Do not use demonstrative determiners such as "this", "that", "these", or "those" for source-derived
-entities. An instruction that asks to summarize, translate, classify, or extract information from an unseen source
-is not standalone; embed the target or reformulate the task. Never mention source titles, headings, or other
-provenance in the instruction or answer. Vary cognitive tasks across rows — do not collapse onto one stem.
-Adapt to the dataset profile modalities. Return only valid JSON and never mention hidden context or this prompt."""
+Each pair is an independent, context-free row: a reader who only sees instruction+output must understand
+the task fully, with no other document open. CONTEXT is private working material only.
+
+Write about named subjects taken from CONTEXT (whatever the domain supplies: entities, rules, procedures,
+metrics, formulas, findings, and so on). Put those names and any defining detail the reader needs inside
+the pair. Frame the pair as reusable knowledge about that subject, not as a quiz about a particular source
+document, chapter, author, or excerpt.
+
+When CONTEXT situates facts inside a study, course, trial, paper, or experiment, treat that setting as
+incidental packaging unless the name itself is required for correctness. Prefer asking about the reusable
+method, metric, procedure, or finding directly rather than anchoring the task as "in the … study/course".
+
+Prefer concrete first mentions of the actual subject over vague stand-ins ("the method", "the system",
+"the result"). Prefer ordinary names and roles over demonstratives when referring to people or objects.
+When a task needs a passage, embed that passage in the instruction, or restate the task around a named
+proposition instead.
+
+Vary cognitive moves across rows and follow the dataset profile when provided. Use only CONTEXT for facts.
+Return only valid JSON and never mention hidden context or this prompt."""
 _SUMMARY_SYSTEM = """You summarize source documents faithfully. Return only valid JSON."""
 _PROFILE_SYSTEM = """You profile unstructured datasets for supervised instruction generation.
 Infer the domain, what valuable material should be extracted, and how instructions and answers should look.
@@ -247,16 +260,29 @@ def instruction_near_fingerprint(text: str, *, max_tokens: int = 12) -> str:
 _CONTEXT_BOUND_INSTRUCTION_RE = re.compile(
     r"(?:"
     r"\baccording to\b|"
-    r"\bas (?:described|outlined|stated|noted|mentioned|discussed|presented) in\b|"
-    r"\bbased on (?:the )?(?:textbook|section|passage|chapter|document|source|text|excerpt|material)\b|"
+    r"\bas (?:described|outlined|stated|noted|mentioned|discussed|presented|reported) in\b|"
+    r"\bdescribed in (?:the\s+)?(?:\w+\s+){0,4}(?:study|paper|article|thesis|praxis|pipeline|overview|document|source|text)\b|"
+    r"\bbased on (?:the )?(?:textbook|section|passage|chapter|document|source|text|excerpt|material|study|paper|praxis)\b|"
     r"\b(?:the |this |that )?(?:textbook|passage|excerpt|chapter|document|source material)\b|"
-    r"\b(?:in|from|per) the (?:textbook|section|passage|chapter|document|source)\b|"
+    r"\b(?:in|from|per) the (?:textbook|section|passage|chapter|document|source|study|paper|article|thesis|praxis)\b|"
     r"\b(?:textbook|section|chapter) (?:title|heading)\b|"
     r"\bprovided (?:textbook|section|passage|chapter|document|text|excerpt)\b|"
     r"\bthe (?:above|following|given|supplied|attached) (?:text|passage|section|excerpt|document)\b|"
-    r"\brefer(?:ring)? to the (?:text|passage|section|textbook|document|source)\b"
+    r"\brefer(?:ring)? to the (?:text|passage|section|textbook|document|source)\b|"
+    r"\b(?:the|this|that)\s+(?:study|paper|article|thesis|praxis|dissertation|research)\b|"
+    r"\bthe authors?\b|"
+    r"\bin this research\b"
     r")",
     re.IGNORECASE,
+)
+
+# Vague subject pointers that leave the reader needing CONTEXT to know which thing is meant.
+_UNDERSPECIFIED_SUBJECT_RE = re.compile(
+    r"(?i)\b(?:the|this|that)\s+"
+    r"(?:procedural\s+mechanism|experimental\s+design|proposed\s+(?:system|method|approach|framework|model|pipeline)|"
+    r"methodology|pipeline|framework|approach|mechanism|procedure|process|technique|"
+    r"method|system|model|algorithm|evaluation|metric|feedback\s+system)"
+    r"\b(?!\s+(?:of|for|called|known\s+as|named)\s+[A-Za-z0-9])"
 )
 
 
@@ -273,6 +299,20 @@ def instruction_cites_source_context(text: str) -> bool:
     return False
 
 
+def pair_self_containment_failure(instruction: str, output: str) -> str | None:
+    """Return a short reason when the pair is not independently understandable, else None."""
+    instr = (instruction or "").strip()
+    out = (output or "").strip()
+    if not instr or not out:
+        return "Empty instruction or output"
+    combined = f"{instr}\n{out}"
+    if instruction_cites_source_context(instr) or _CONTEXT_BOUND_INSTRUCTION_RE.search(out):
+        return "Pair depends on unseen source provenance"
+    if _UNDERSPECIFIED_SUBJECT_RE.search(combined):
+        return "Pair uses an underspecified subject instead of a named one"
+    return None
+
+
 def instruction_stem_key(text: str, *, max_tokens: int = 5) -> str:
     """Coarse opening-stem key used to cap repeated instruction templates."""
     normalized = normalize_instruction_for_dedup(text)
@@ -283,11 +323,6 @@ def instruction_stem_key(text: str, *, max_tokens: int = 5) -> str:
     ]
     if not tokens:
         return normalized[:48]
-    # Collapse "list/state ... criteria ..." openers onto one family key.
-    if tokens[0] in {"list", "state", "give", "outline"} and "criteria" in tokens[:6]:
-        return "list criteria"
-    if "criteria" in tokens[:5] and any(tok in tokens[:5] for tok in ("diagnostic", "diagnosis", "essentials")):
-        return "list criteria"
     return " ".join(tokens[:max_tokens])
 
 
@@ -301,8 +336,8 @@ class InstructionDeduper:
     def __init__(
         self,
         *,
-        max_stem_share: float = 0.22,
-        min_before_stem_cap: int = 6,
+        max_stem_share: float = 0.14,
+        min_before_stem_cap: int = 3,
         store_path: Path | None = None,
     ) -> None:
         import dbm
@@ -631,7 +666,9 @@ Critical sampling notes:
   / formatting-guideline tasks unless the corpus is genuinely about institutional submission policy.
 
 Do NOT include line-analyst, summarizer, needle, or detail-researcher — those are already added.
-Keep preferred_task_types to 4 short abstract labels (diverse cognitive moves).
+Keep preferred_task_types to 4 short abstract cognitive-move labels (2-5 words or snake_case), e.g.
+"explain_named_mechanism", "compare_named_methods", "extract_criteria" — never full sample questions
+or ready-made instruction templates.
 Persona description and question_style: one short sentence each.
 Prefer chunk_level paragraph or section unless line is clearly better.
 
@@ -642,10 +679,11 @@ Return only JSON:
   "content_signals": ["signal1", "signal2"],
   "extractable_assets": ["asset1", "asset2"],
   "preferred_task_types": ["task1", "task2", "task3", "task4"],
-  "instruction_guidance": "standalone named-subject rules; no example stems",
-  "answer_guidance": "concise factual answers across the task types",
+  "instruction_guidance": "standalone named-subject rules; include necessary defining details in the pair; never point at the source document",
+  "answer_guidance": "concise factual answers that name the subject; no 'the study found' phrasing",
   "avoid": ["repeating the same task type or instruction stem across rows",
-            "front-matter, copyright, or submission-admin tasks"],
+            "front-matter, copyright, or submission-admin tasks",
+            "referring to the study/paper/authors or using bare definite phrases like 'the method' without naming it"],
   "recommended_chunk_level": "document|section|paragraph|line|needle|page",
   "personas": [
     {{"name": "short-kebab-name", "description": "who they are and their goal",
@@ -684,16 +722,19 @@ Diversity requirements (critical):
 - List 4 to 6 distinct preferred_task_types that are actually supported by the samples. Cover different cognitive
   moves (e.g. define, explain mechanism, diagnose/classify, apply a rule/procedure, compare, extract criteria,
   contraindications/edge cases) — not minor wording variants of one task.
+- Phrase preferred_task_types as short abstract cognitive-move labels (snake_case or 2-5 words), never as
+  full instruction templates or sample questions.
 - Do NOT overweight one modality. For clinical/medical sources, treatments are only ONE of several equal options
   alongside presentation/findings, diagnostic criteria, differentials, pathophysiology, complications, and
   contraindications/monitoring.
-- instruction_guidance must describe ABSTRACT phrasing rules only (standalone, named subject, no demonstratives).
+- instruction_guidance must describe ABSTRACT phrasing rules only (standalone, named subject, no demonstratives,
+  include necessary defining clauses in the pair, never refer to the source document).
   It must NOT contain a concrete sample question, template, or single canonical stem such as
   "What is the first-line treatment for ...?".
-- answer_guidance should allow concise factual answers, short lists, and brief explanations — not only
-  "recommend treatment" style responses.
+- answer_guidance should allow concise factual answers, short lists, and brief explanations that name the subject —
+  not "the study found…" phrasing and not only "recommend treatment" style responses.
 - Put "repeating the same task type or instruction stem across rows" in avoid.
-- Also avoid front-matter / copyright / submission-admin tasks.
+- Also avoid front-matter / copyright / submission-admin tasks and study/paper/author pointers.
 
 Examples of modality adaptation (balanced — do not reduce a domain to one bullet):
 - Math textbooks: formulas, identities, theorem statements, proof steps, worked calculations.
@@ -710,10 +751,11 @@ Return only:
   "content_signals": ["signal1", "signal2", "signal3"],
   "extractable_assets": ["asset1", "asset2", "asset3"],
   "preferred_task_types": ["task1", "task2", "task3", "task4"],
-  "instruction_guidance": "abstract phrasing rules only; no example questions",
-  "answer_guidance": "how answers should be phrased across the diverse task types",
+  "instruction_guidance": "abstract phrasing rules only; named subjects; include necessary defining clauses; no study/paper pointers",
+  "answer_guidance": "how answers should be phrased across the diverse task types; name the subject; no 'the study found'",
   "avoid": ["repeating the same task type or instruction stem across rows",
-            "front-matter, copyright, or submission-admin tasks"],
+            "front-matter, copyright, or submission-admin tasks",
+            "referring to the study/paper/authors or bare definite phrases like 'the method' without naming it"],
   "recommended_chunk_level": "document|section|paragraph|line|needle|page"
 }}
 
@@ -725,6 +767,38 @@ Sample skim:
         raise ValueError("Dataset profile response must be a JSON object")
     profile = DatasetProfile.from_dict(value)
     return _normalize_dataset_profile(profile)
+
+
+def _abstract_task_label(task: str) -> str:
+    """Turn sentence-like preferred_task_types into short cognitive-move labels."""
+    raw = (task or "").strip()
+    if not raw:
+        return raw
+    lowered = raw.casefold()
+    words = re.findall(r"[a-z0-9]+", lowered)
+    already_short = len(words) <= 5 and not re.match(
+        r"^(explain|outline|evaluate|compare|identify|define|describe|list|summarize|help)\b",
+        lowered,
+    )
+    if already_short and ("_" in raw or "-" in raw or raw.islower()):
+        return raw
+    verb_moves = (
+        (r"^(?:explain|describe)\b", "explain_mechanism_or_application"),
+        (r"^(?:outline|walk)\b", "apply_or_sequence_supported_procedure"),
+        (r"^(?:evaluate|assess)\b", "evaluate_supported_criteria"),
+        (r"^compare\b", "compare_or_differentiate"),
+        (r"^(?:identify|list)\b.*(?:metric|measure|indicator)", "identify_supported_metrics"),
+        (r"^(?:identify|list)\b", "extract_supported_facts_or_assets"),
+        (r"^define\b", "define_or_clarify_term"),
+        (r"^summarize\b", "transform_summarize_or_structure"),
+        (r"^help\b", "apply_rule_or_procedure"),
+    )
+    for pattern, label in verb_moves:
+        if re.match(pattern, lowered):
+            return label
+    if len(words) > 5:
+        return "_".join(words[:4])
+    return raw
 
 
 def _normalize_dataset_profile(profile: DatasetProfile) -> DatasetProfile:
@@ -747,7 +821,6 @@ def _normalize_dataset_profile(profile: DatasetProfile) -> DatasetProfile:
                 seen.add(extra)
             if len(deduped) >= 4:
                 break
-    tasks = tuple(deduped[:6])
 
     guidance = profile.instruction_guidance.strip()
     # Strip accidental concrete stems/examples that overfit all rows to one pattern.
@@ -758,19 +831,19 @@ def _normalize_dataset_profile(profile: DatasetProfile) -> DatasetProfile:
     ):
         guidance = (
             "Write standalone instructions that name the subject explicitly. "
-            "Vary the cognitive task across rows using the preferred task types; "
-            "do not reuse one stem. Never refer to the source document or its headings by name."
+            "Vary the cognitive task and the surface wording across rows; "
+            "do not reuse one stem or template opener."
         )
-    # Soften stem-like task labels into abstract cognitive moves.
+
     abstract_tasks: list[str] = []
-    for task in tasks:
+    for task in deduped[:6]:
         lowered = task.casefold()
         if re.match(r"^list\b", lowered) and "criteria" in lowered:
             abstract_tasks.append("state_supported_criteria_or_essentials")
         elif "first-line treatment" in lowered or lowered.startswith("recommend treatment"):
             abstract_tasks.append("identify_supported_management_or_treatment_options")
         else:
-            abstract_tasks.append(task)
+            abstract_tasks.append(_abstract_task_label(task))
     tasks = tuple(dict.fromkeys(abstract_tasks))  # preserve order, drop dups
 
     avoid = list(profile.avoid)
@@ -1620,16 +1693,16 @@ def sample_pair_augmentation(
         k=1,
     )[0]
     forms = [
-        "Knowledge recall: ask an independently understandable 'What is X?' style question naming the subject.",
-        "Explanation: ask to explain why X happens or how a mechanism works, using a direct command or question.",
-        "Transformation: ask to summarize, classify, or structure X into a clearer form.",
-        "Comparison: contrast two named conditions, findings, or rules supported by CONTEXT (X vs Y).",
-        "Application: given a short named scenario S, ask how to apply rule or concept X.",
-        "Reasoning: ask what follows from X / what can be inferred from the stated facts.",
-        "Critique: ask whether claim C is correct or supported, and why.",
-        "Decision: ask when X should be used (or not), with criteria grounded in CONTEXT.",
-        "Use a natural request such as 'Tell me...', 'Help me...', or 'Walk me through...'.",
-        "Use a workflow-style instruction that asks the persona's task to be carried out.",
+        "Write a short direct question that names the subject.",
+        "Write a crisp imperative that names the subject; pick a natural verb for the ask.",
+        "Write a conversational request that names the subject.",
+        "Ask why named subject X happens or how named mechanism M works.",
+        "Ask for a contrast between two explicitly named things from CONTEXT.",
+        "Give a short named scenario and ask how to apply a named rule or concept.",
+        "Ask what follows from explicitly stated facts about a named subject.",
+        "Ask whether a named claim is correct or supported, and why.",
+        "Ask when a named approach should be used or avoided, with named criteria.",
+        "Ask for a procedure or workflow, naming the artifact being worked on.",
     ]
     if form_index is None:
         instruction_form = rng.choice(forms)
@@ -1658,6 +1731,7 @@ def generate_pair(
     require_standalone: bool,
     augmentation: dict[str, str],
     dataset_profile: DatasetProfile | None = None,
+    repair_hint: str | None = None,
 ) -> GeneratedPair:
     profile_block = (
         f"Dataset profile:\n{dataset_profile.prompt_block()}\n"
@@ -1665,106 +1739,64 @@ def generate_pair(
         else "Dataset profile: none supplied; stay faithful to CONTEXT alone.\n"
     )
     task_focus = augmentation.get("task_focus") or "CONTEXT-supported task"
-    prompt = f"""Create exactly one source-grounded instruction/answer pair that can be used without showing the source.
-The source may come from any domain, but you must adapt to the dataset profile below when one is provided.
-
+    repair_block = ""
+    if repair_hint:
+        repair_block = f"\nRewrite note: {repair_hint.strip()}\n"
+    prompt = f"""Create exactly one source-grounded instruction/answer pair.
+CONTEXT is private. Write the pair as reusable domain knowledge a reader can use with no other document open:
+name the subjects, and put any needed definition, setting, formula, or short clause inside instruction+output.
+{repair_block}
 Persona: {persona.name}
 Goal: {persona.description}
-Question style (tendency only — do NOT reuse one fixed stem on every row): {persona.question_style}
+Question style (tendency only — rotate stems): {persona.question_style}
 Standalone required: {str(require_standalone).lower()}
 
 {profile_block}
-Perspective:
-- Imagine a realistic user represented by PERSONA is using the information in CONTEXT.
-- For THIS row, prioritize the assigned task focus below when CONTEXT supports it. If CONTEXT cannot support
-  that focus, pick the nearest supported alternative from the profile's preferred task types — do not default
-  to whichever stem is most familiar for the domain.
+How to use CONTEXT:
+- HEADER / summary / section path are private scaffolding for you; the user-facing pair talks about the subject
+  matter itself using names from CONTEXT, not about a particular document instance.
+- If CONTEXT places a fact inside a study, course, trial, or experiment, lift the reusable subject (named method,
+  metric, procedure, finding) into the pair. Keep a course/study name only when it is necessary to identify
+  that subject; otherwise drop the setting and ask about the subject directly.
+- Assigned task focus is a cognitive goal label only — do NOT paste it as the instruction text.
 - Assigned task focus for this row: {task_focus}
-- Write that task as the instruction, then write the answer that would satisfy the user.
-- The persona controls the goal and type of work, not the wording used to refer to hidden source material.
-- HEADER, document summary, and section path are private scaffolding only — never quote or allude to them in
-  the instruction or output.
-- Use extractable assets from CONTEXT when relevant (criteria, definitions, mechanisms, rules, formulas, etc.),
-  not only the most common action-oriented pattern for the domain.
-- First choose a task that CONTEXT can fully answer. If CONTEXT only states a result, definition, holding,
-  finding, or procedure incompletely, ask for what is explicitly present. Do not invent missing steps,
-  lemmas, citations, numbers, code, diagnoses, or arguments.
-- Never answer a question or task that CONTEXT only poses unless CONTEXT also contains the supporting
-  facts, procedure, ruling, result, or explanation needed to answer it. Prompt-only or unanswered-task
-  chunks are invalid sources for answered pairs.
+- Realize that goal with a fresh surface form. Vary opener, syntax, and length so this row does not look like
+  a template with different nouns slotted in.
+- Choose a task CONTEXT can fully answer. Prefer the stated fragment over inventing missing steps, numbers, or claims.
+- If CONTEXT only poses a question without the answer material, pick a different supported task.
 
 Variation profile for this example:
-- Task focus: {task_focus}
+- Task focus (goal, not wording): {task_focus}
 - Specificity: {augmentation["specificity"]}
 - Entities: {augmentation["entity_style"]}
 - Instruction form: {augmentation["instruction_form"]}
 
-Core requirements:
-- Follow the requested instruction form. An instruction may be a question, direct command, natural request, or
-  workflow task; do not force every instruction into a "What is...?" or "Recommend treatment..." stem.
-- Follow the dataset profile's instruction_guidance and answer_guidance when provided, but never let them
-  collapse every row into one task type.
-- Avoid the behaviors listed in the dataset profile's avoid list.
-- The answer must be fully supported by CONTEXT. Every substantive claim, formula, number, name, rule, step,
-  and conclusion in the output must be recoverable from CONTEXT without outside knowledge.
-- Prefer extractive or tightly reconstructive tasks over speculative completion. If a procedure, argument,
-  analysis, or explanation is only partly present, ask for the stated fragment or a supported consequence,
-  not a completed version invented from general knowledge.
-- If a TARGET is provided, test that target while using the rest only as the surrounding haystack.
-- The instruction must establish every entity and fact needed to understand and answer it without seeing CONTEXT.
-- For translation, simplification, summarization, rewriting, classification, or extraction tasks, embed the exact
-  target passage or data inside the instruction. If embedding it is unnecessary, reformulate the task around a
-  named proposition, rule, event, or subject. Never ask the user to act on an unseen paragraph, excerpt, record,
-  document, image, table, or code sample.
-- On first mention, introduce a generalized entity with an indefinite role or type, such as "a tenant",
-  "an API client", "a chemical compound", or "a financial institution".
-- Write the task as a reusable scenario, not as commentary about one source instance. Refer back with a meaningful
-  role, noun, or fact.
-- In both returned fields, use no demonstrative determiner ("this", "that", "these", or "those") for an entity,
-  event, case, document, study, function, condition, result, or scenario derived from CONTEXT.
-- Make the final request name the actual subject of the task. For example:
-  - "What management is appropriate for recurrent bradycardia?" rather than "What should be done for this patient?"
-  - "What legal rule applies when a tenant breaks the lease?" rather than "What did this case establish?"
-  - "How should a function that returns a null value be fixed?" rather than "How should this function be fixed?"
-  - "State the formula for the differential of f at a" rather than "Explain what the text says about derivatives."
-- Write the answer as a direct, reusable statement about the named subject, principle, process, or result.
-- Keep both fields self-contained: do not refer to unseen source material via provenance cues (source title,
-  section/chapter/heading labels, "according to …", "based on the …", "as described in …", "the text above",
-  or "the provided/given material"). Ask about the named subject directly — the training pair will not include
-  the source.
-- Make the example transferable by removing incidental identity and provenance details that do not affect the answer.
-- Preserve names, identifiers, dates, numbers, quotations, formulas, and terminology when they are necessary for
-  correctness.
-- Apply the variation profile only when it preserves truth. Never widen a number, replace a named entity, or remove
-  an attribute when doing so would alter the answer.
-- The output should state the answer using the named subject, principle, process, formula, or result rather than a
-  generic reference back to the source scenario.
-- Do not ask for citations or line numbers unless they exist in the context.
-- Keep the answer direct but complete.
-- If you cannot form a fully CONTEXT-supported answer for this persona and chunk, choose a narrower supported task
-  instead of guessing.
+Target shape:
+- Instruction form and shape examples are inspiration only — invent a natural wording for this row; do not
+  copy an example stem or fill the same template across rows.
+- Make the instruction sound like a real standalone ask: vary opener, length, and syntax from row to row.
+- Ground every substantive claim in CONTEXT.
+- Name the actual subject from CONTEXT on first use; include any defining detail the reader needs.
+- Ask about the named method, metric, procedure, or finding itself; do not hang the task on incidental
+  study/course/trial/experiment setting language.
+- For translate / summarize / classify / extract tasks, embed the target passage in the instruction, or reframe
+  around a named proposition so the pair stays self-contained.
+- Prefer indefinite roles when no proper name exists ("a tenant", "an API client"); keep proper names when
+  they are central to correctness.
+- Phrase both fields as ordinary statements about the named subject.
+- Preserve names, numbers, formulas, and terminology required for a correct answer; apply the variation profile
+  only when it preserves truth.
+- If a fully supported answer is not possible, narrow the task rather than guessing.
 
-Cross-domain rewrite examples (illustrations only — rotate among shapes; never lock onto one):
-- Medical: "What findings suggest Y?", "Explain the mechanism of Z", "Which conditions are in the differential for X?",
-  "What complication is associated with X?", "When is treatment A contraindicated for X?"
-- Legal: "What did this case establish?" becomes "Explain the rule that applies when a landlord retains a deposit."
-  The answer begins "The applicable rule is...", not "This case established..."
-- Software: "Why does this function fail?" becomes "Tell me why a parser fails when input ends with a delimiter."
-  The answer begins "The parser fails because...", not "This function fails because..."
-- Math: "What does the text say about derivatives?" becomes "State the relationship between the differential of f
-  at a and f'(a)." The answer should include the formula when CONTEXT provides it.
-- Research: "What do these results show?" becomes "Describe the relationship between the measured variables."
-  The answer names the relationship directly.
+Shape examples (illustrations of variety only — invent your own wording from CONTEXT):
+- Medical: "What findings suggest Y?", "Explain the mechanism of Z", "When is treatment A contraindicated for X?"
+- Legal: "Explain the rule that applies when a landlord retains a deposit." → answer: "The applicable rule is..."
+- Software: "Tell me why a parser fails when input ends with a delimiter." → answer: "The parser fails because..."
+- Math: "State the relationship between the differential of f at a and f'(a)." (include the formula when present)
+- Research: "How does method A differ from method B on metric M under condition C?"
+- Procedures: "Walk me through how named procedure P produces outcome O with the stated settings."
 
-Before returning:
-1. Silently draft a grounded task that matches the assigned task focus when possible.
-2. Confirm every answer claim is present in or directly entailed by CONTEXT; otherwise narrow the task.
-3. Rewrite into a reusable, referentially closed pair with no provenance cues or demonstratives.
-4. Silently scan both fields for source-references and rewrite any that remain.
-5. Verify that every substantive claim remains grounded in CONTEXT.
-6. If CONTEXT contains formulas, holdings, criteria, code, or other profile assets, check that the pair uses them
-   when relevant instead of only paraphrasing surrounding prose.
-7. Reject drafts that ignore the assigned task focus just to reuse a familiar domain stem.
+Before returning, silently check: grounded in CONTEXT, subjects named, defining details included, wording not a copied template.
 
 Return:
 {{"instruction": "...", "output": "...", "standalone": true}}
@@ -1912,54 +1944,82 @@ def generate_grounded_pair(
             task_focus=task_focus,
             form_index=(form_index + attempt_i) if form_index is not None else None,
         )
-        try:
-            pair = generate_pair(
-                backend,
-                persona,
-                chunk,
-                header,
-                require_standalone=True,
-                augmentation=augmentation,
-                dataset_profile=dataset_profile,
+        repair_hint: str | None = None
+        # A few local rewrites on the same chunk before falling through to another chunk.
+        for _local_try in range(3):
+            try:
+                pair = generate_pair(
+                    backend,
+                    persona,
+                    chunk,
+                    header,
+                    require_standalone=True,
+                    augmentation=augmentation,
+                    dataset_profile=dataset_profile,
+                    repair_hint=repair_hint,
+                )
+            except Exception as exc:  # noqa: BLE001 - retry across chunk/pair attempts
+                last_error = exc
+                repair_hint = (
+                    "Previous draft failed to parse or was incomplete. Produce one self-contained "
+                    "instruction/output pair that names its subjects from CONTEXT."
+                )
+                continue
+            failure = pair_self_containment_failure(pair.instruction, pair.output)
+            if failure:
+                last_error = ValueError(failure)
+                repair_hint = (
+                    "Previous draft was not independently understandable. Rewrite so the instruction "
+                    "names the concrete subject from CONTEXT and states reusable domain knowledge; "
+                    "put any needed defining detail inside the pair."
+                )
+                continue
+            if deduper is not None and not deduper.try_claim(pair.instruction):
+                last_error = ValueError("Duplicate, near-duplicate, or overused instruction stem rejected")
+                repair_hint = (
+                    "Previous draft reused a common instruction template or stem. Keep the same cognitive "
+                    "goal, but rewrite with a different opener and syntactic shape; name the subject."
+                )
+                # Give one rewrite a chance; otherwise move to another chunk.
+                if _local_try >= 1:
+                    break
+                continue
+            if not verify_grounding:
+                return (
+                    chunk,
+                    pair,
+                    {
+                        "grounded": None,
+                        "supporting_excerpts": [],
+                        "unsupported_claims": [],
+                        "reason": "grounding check skipped",
+                    },
+                    augmentation,
+                    header,
+                )
+            try:
+                grounding = verify_pair_grounding(
+                    backend,
+                    chunk_text=chunk.text,
+                    instruction=pair.instruction,
+                    output=pair.output,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                repair_hint = (
+                    "Previous draft could not be verified. Produce a narrower answer fully supported by CONTEXT."
+                )
+                continue
+            if grounding["grounded"]:
+                return chunk, pair, grounding, augmentation, header
+            last_error = ValueError(
+                "Generated pair failed grounding check: "
+                + (grounding["reason"] or ", ".join(grounding["unsupported_claims"]) or "unsupported claims")
             )
-        except Exception as exc:  # noqa: BLE001 - retry across chunk/pair attempts
-            last_error = exc
-            continue
-        if instruction_cites_source_context(pair.instruction):
-            last_error = ValueError("Instruction cites unseen source provenance")
-            continue
-        if deduper is not None and not deduper.try_claim(pair.instruction):
-            last_error = ValueError("Duplicate, near-duplicate, or overused instruction stem rejected")
-            continue
-        if not verify_grounding:
-            return (
-                chunk,
-                pair,
-                {
-                    "grounded": None,
-                    "supporting_excerpts": [],
-                    "unsupported_claims": [],
-                    "reason": "grounding check skipped",
-                },
-                augmentation,
-                header,
+            repair_hint = (
+                "Previous draft added unsupported claims. Narrow the task so every answer claim is present "
+                "in CONTEXT, and keep subjects named."
             )
-        try:
-            grounding = verify_pair_grounding(
-                backend,
-                chunk_text=chunk.text,
-                instruction=pair.instruction,
-                output=pair.output,
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            continue
-        if grounding["grounded"]:
-            return chunk, pair, grounding, augmentation, header
-        last_error = ValueError(
-            "Generated pair failed grounding check: "
-            + (grounding["reason"] or ", ".join(grounding["unsupported_claims"]) or "unsupported claims")
-        )
     raise last_error or ValueError("Failed to generate a grounded pair")
 
 

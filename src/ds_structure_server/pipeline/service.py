@@ -939,16 +939,22 @@ def run_structure_job(
     combined_path.parent.mkdir(parents=True, exist_ok=True)
     with combined_path.open("wb") as handle:
         wrote = False
+        needs_newline = False
         for path in persona_train_paths.values():
             if not path.exists() or path.stat().st_size == 0:
                 continue
+            if needs_newline:
+                handle.write(b"\n")
+                needs_newline = False
             with path.open("rb") as src:
-                shutil.copyfileobj(src, handle, length=64 * 1024)
-            if handle.tell() > 0:
-                handle.seek(-1, os.SEEK_END)
-                if handle.read(1) != b"\n":
-                    handle.write(b"\n")
+                data = src.read()
+            if not data:
+                continue
+            handle.write(data)
+            needs_newline = not data.endswith(b"\n")
             wrote = True
+        if needs_newline:
+            handle.write(b"\n")
     if not wrote:
         combined_path = None
 
