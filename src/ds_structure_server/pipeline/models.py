@@ -71,7 +71,8 @@ class DatasetProfile:
                 f"Recommended chunk level: {self.recommended_chunk_level or 'persona-default'}",
                 "Diversity: each row should pursue a different supported task when CONTEXT allows; "
                 "rotate among the preferred task types rather than one familiar stem.",
-                "Shape: write reusable named-subject Q&A; put defining details inside the pair so it stands alone.",
+                "Shape: write reusable named-subject Q&A from CONTEXT as ground-truth data points; "
+                "do not mention studies, articles, papers, or authors in the pair.",
             ]
         )
 

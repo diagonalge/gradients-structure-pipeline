@@ -152,9 +152,18 @@ metrics, formulas, findings, and so on). Put those names and any defining detail
 the pair. Frame the pair as reusable knowledge about that subject, not as a quiz about a particular source
 document, chapter, author, or excerpt.
 
-When CONTEXT situates facts inside a study, course, trial, paper, or experiment, treat that setting as
-incidental packaging unless the name itself is required for correctness. Prefer asking about the reusable
-method, metric, procedure, or finding directly rather than anchoring the task as "in the … study/course".
+If CONTEXT comes from a study, article, paper, thesis, praxis, trial, or similar research write-up, treat
+the stated facts, methods, numbers, and definitions as ground truth for the pair. Do not mention the study,
+article, paper, authors, or that the material was researched or reported — just turn the chunk into a clean
+standalone data point about the subject matter.
+
+Pronouns and vague referents ("it", "they", "this", "that") are allowed only when the same sentence (or the
+immediately preceding clause in the same instruction) has already named the antecedent. Otherwise name the
+subject explicitly.
+
+When CONTEXT situates facts inside a course, experiment, or other setting, treat that setting as incidental
+packaging unless the name itself is required for correctness. Prefer asking about the reusable method,
+metric, procedure, or finding directly.
 
 Prefer concrete first mentions of the actual subject over vague stand-ins ("the method", "the system",
 "the result"). Prefer ordinary names and roles over demonstratives when referring to people or objects.
@@ -1753,11 +1762,12 @@ Standalone required: {str(require_standalone).lower()}
 
 {profile_block}
 How to use CONTEXT:
-- HEADER / summary / section path are private scaffolding for you; the user-facing pair talks about the subject
-  matter itself using names from CONTEXT, not about a particular document instance.
-- If CONTEXT places a fact inside a study, course, trial, or experiment, lift the reusable subject (named method,
-  metric, procedure, finding) into the pair. Keep a course/study name only when it is necessary to identify
-  that subject; otherwise drop the setting and ask about the subject directly.
+- Use only CONTEXT (and TARGET when provided). Do not invent document titles, study names, or author framing.
+- If CONTEXT is from a study, article, paper, thesis, praxis, or trial: accept its statements as ground truth
+  and emit a normal domain data point. Do not mention the study/article/paper/authors in instruction or output.
+- If CONTEXT places a fact inside a course, experiment, or other setting, lift the reusable subject (named method,
+  metric, procedure, finding) into the pair. Keep a setting name only when it is necessary to identify that
+  subject; otherwise drop the packaging and ask about the subject directly.
 - Assigned task focus is a cognitive goal label only — do NOT paste it as the instruction text.
 - Assigned task focus for this row: {task_focus}
 - Realize that goal with a fresh surface form. Vary opener, syntax, and length so this row does not look like
@@ -1777,8 +1787,10 @@ Target shape:
 - Make the instruction sound like a real standalone ask: vary opener, length, and syntax from row to row.
 - Ground every substantive claim in CONTEXT.
 - Name the actual subject from CONTEXT on first use; include any defining detail the reader needs.
+- Pronouns like "it"/"they"/"this" need a local named antecedent in the same instruction; otherwise name the subject.
 - Ask about the named method, metric, procedure, or finding itself; do not hang the task on incidental
-  study/course/trial/experiment setting language.
+  study/course/trial/experiment setting language, and do not narrate that the fact came from research.
+- Phrase the answer as a direct factual statement about the subject, not as a report of what a study found.
 - For translate / summarize / classify / extract tasks, embed the target passage in the instruction, or reframe
   around a named proposition so the pair stays self-contained.
 - Prefer indefinite roles when no proper name exists ("a tenant", "an API client"); keep proper names when
@@ -1788,6 +1800,27 @@ Target shape:
   only when it preserves truth.
 - If a fully supported answer is not possible, narrow the task rather than guessing.
 
+Ground-truth framing (BAD → GOOD):
+BAD: "What did the study find about Model X?" / "It found that Model X reduced latency by 31%."
+GOOD: "How did Model X affect inference latency under the tested configuration?" /
+      "Model X reduced inference latency by 31% under the tested configuration."
+
+BAD: "According to the 2026 research, which factor predicted Y?" / "Factor Z."
+GOOD: "Which factor predicted Y in the evaluated population?" /
+      "Factor Z predicted Y in the evaluated population."
+
+BAD: "What approach did the authors propose?" / "They proposed Adaptive Routing."
+GOOD: "What approach uses dynamically selected routes to perform [named function]?" /
+      "Adaptive Routing uses dynamically selected routes to perform [named function]."
+
+BAD: "What happened in this experiment when temperature reached 80°C?" / "The reaction rate doubled."
+GOOD: "What happens to the measured reaction rate at 80°C under the described reaction conditions?" /
+      "The measured reaction rate doubles at 80°C under those conditions."
+
+Local antecedents (reject bare pronouns; allow when the subject is named in-instruction):
+BAD: "Why does it improve accuracy?"
+GOOD: "Why does grouped-query attention reduce KV-cache memory, and how does it affect inference efficiency?"
+
 Shape examples (illustrations of variety only — invent your own wording from CONTEXT):
 - Medical: "What findings suggest Y?", "Explain the mechanism of Z", "When is treatment A contraindicated for X?"
 - Legal: "Explain the rule that applies when a landlord retains a deposit." → answer: "The applicable rule is..."
@@ -1796,13 +1829,11 @@ Shape examples (illustrations of variety only — invent your own wording from C
 - Research: "How does method A differ from method B on metric M under condition C?"
 - Procedures: "Walk me through how named procedure P produces outcome O with the stated settings."
 
-Before returning, silently check: grounded in CONTEXT, subjects named, defining details included, wording not a copied template.
+Before returning, silently check: grounded in CONTEXT, subjects named (or pronouns with local antecedents),
+no study/article/author framing, wording not a copied template.
 
 Return:
 {{"instruction": "...", "output": "...", "standalone": true}}
-
-HEADER:
-{header}
 
 TARGET:
 {chunk.target_text}
