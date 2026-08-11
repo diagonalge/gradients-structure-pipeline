@@ -11,6 +11,8 @@ import sys
 import tempfile
 from collections import defaultdict
 from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from csv import DictReader
 from dataclasses import dataclass
 from itertools import islice
@@ -416,6 +418,25 @@ _DEFAULT_NATIVE_PDF_MAX_PAGES = int(os.getenv("STRUCTURE_PDF_MAX_PAGES", "80"))
 _MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_MAX_DOCUMENT_CHARS", "500000"))
 _MAX_STRUCTURED_FILE_BYTES = int(os.getenv("STRUCTURE_MAX_STRUCTURED_FILE_BYTES", str(32 * 1024 * 1024)))
 _MAX_ZIP_UNCOMPRESSED_BYTES = int(os.getenv("STRUCTURE_MAX_ZIP_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
+# Suggest/discovery: fewer OCR pages + lower DPI — personas only need a skim.
+_SUGGEST_OCR_DPI = int(os.getenv("STRUCTURE_SUGGEST_OCR_DPI", "120"))
+_SUGGEST_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_SUGGEST_OCR_MAX_PAGES", "8"))
+_SUGGEST_MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_SUGGEST_MAX_DOCUMENT_CHARS", "120000"))
+_LIGHT_DOCUMENT_MODE: ContextVar[bool] = ContextVar("structure_light_document_mode", default=False)
+
+
+@contextmanager
+def light_document_mode(enabled: bool = True):
+    """Bound PDF/OCR/text extraction for suggest/discovery (not full generation)."""
+    token = _LIGHT_DOCUMENT_MODE.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _LIGHT_DOCUMENT_MODE.reset(token)
+
+
+def _in_light_document_mode() -> bool:
+    return bool(_LIGHT_DOCUMENT_MODE.get())
 
 
 def _safe_extract_zip(zip_path: Path, destination: Path) -> Path:
@@ -452,9 +473,12 @@ def _normalize_extracted_text(text: str) -> str:
 
 
 def _truncate_chars(text: str, limit: int = _MAX_DOCUMENT_CHARS) -> str:
-    if limit <= 0 or len(text) <= limit:
+    cap = limit
+    if _in_light_document_mode():
+        cap = min(cap, _SUGGEST_MAX_DOCUMENT_CHARS)
+    if cap <= 0 or len(text) <= cap:
         return text
-    return text[:limit]
+    return text[:cap]
 
 
 def _pdf_native_text(
@@ -465,6 +489,9 @@ def _pdf_native_text(
 ) -> tuple[str, int]:
     from pypdf import PdfReader
 
+    if _in_light_document_mode():
+        max_pages = min(max_pages, _SUGGEST_OCR_MAX_PAGES * 2) if max_pages > 0 else _SUGGEST_OCR_MAX_PAGES * 2
+        max_chars = min(max_chars, _SUGGEST_MAX_DOCUMENT_CHARS)
     reader = PdfReader(path)
     total_pages = len(reader.pages)
     limit = total_pages if max_pages <= 0 else min(total_pages, max_pages)
@@ -502,6 +529,9 @@ def _ocr_pdf(
     dpi: int = _DEFAULT_OCR_DPI,
     max_pages: int = _DEFAULT_OCR_MAX_PAGES,
 ) -> str:
+    if _in_light_document_mode():
+        dpi = min(dpi, _SUGGEST_OCR_DPI)
+        max_pages = min(max_pages, _SUGGEST_OCR_MAX_PAGES) if max_pages > 0 else _SUGGEST_OCR_MAX_PAGES
     try:
         import pytesseract
         from pdf2image import convert_from_path

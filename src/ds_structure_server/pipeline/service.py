@@ -15,7 +15,12 @@ from loguru import logger
 
 from .inference import InferenceBackend, build_default_backend
 from .instruct_detect import InstructPairDetection, detect_instruct_pair_from_path
-from .loader import _STRUCTURED_SUFFIXES, load_hf_documents_isolated, load_local_documents
+from .loader import (
+    _STRUCTURED_SUFFIXES,
+    light_document_mode,
+    load_hf_documents_isolated,
+    load_local_documents,
+)
 from .models import ChunkLevel, DatasetProfile, Persona, SourceDocument
 from .parsing import parse_document
 from .pipeline import (
@@ -341,6 +346,7 @@ def _detect_ready_instruct(
     sources: list[str],
     *,
     download_dir: Path,
+    local_path: Path | None = None,
 ) -> InstructPairDetection:
     """Fast path: CSV/JSON/JSONL (or single HF sample) already looks like instruct data."""
     if len(sources) == 1 and _looks_like_hf_dataset(sources[0]):
@@ -349,7 +355,7 @@ def _detect_ready_instruct(
         return InstructPairDetection(already_instruct=False)
 
     try:
-        local_path = materialize_sources(sources, download_dir)
+        resolved = local_path if local_path is not None else materialize_sources(sources, download_dir)
     except ValueError as exc:
         # HF-only / path errors mean "not a local structured upload" — treat as needs structuring.
         message = str(exc)
@@ -358,12 +364,12 @@ def _detect_ready_instruct(
         raise
 
     candidates: list[Path] = []
-    if local_path.is_file():
-        candidates = [local_path]
-    elif local_path.is_dir():
+    if resolved.is_file():
+        candidates = [resolved]
+    elif resolved.is_dir():
         candidates = sorted(
             child
-            for child in local_path.rglob("*")
+            for child in resolved.rglob("*")
             if child.is_file() and child.suffix.casefold() in _STRUCTURED_SUFFIXES
         )
 
@@ -387,6 +393,15 @@ def _detect_ready_instruct(
             format=first.format,
         )
     return InstructPairDetection(already_instruct=False)
+
+
+def _estimate_capacity_from_chars(chars: int, *, n_personas: int) -> int:
+    """Calibrated floor: ~50k chars ≈ 1000 rows with the default ~5-persona mix."""
+    if chars <= 0:
+        return 0
+    base = chars / 50.0
+    scale = max(1.0, float(n_personas) / 5.0)
+    return max(0, int(base * scale))
 
 
 def _partition_persona_names(names: list[str]) -> tuple[list[str], list[str]]:
@@ -508,141 +523,174 @@ def suggest_structure_for_sources(
     logger.info("suggest: start sources={} count={}", cleaned[:3], len(cleaned))
     work = Path(tempfile.mkdtemp(prefix="structure-suggest-"))
     try:
-        detect_dir = work / "detect"
-        logger.info("suggest: detecting already-instruct format")
-        ready = _detect_ready_instruct(cleaned, download_dir=detect_dir)
-        if ready.already_instruct:
-            rows = int(ready.row_count or 0)
+        with light_document_mode(True):
+            config = StructureJobConfig(
+                source=cleaned[0],
+                sources=cleaned,
+                output_dir=work,
+                num_rows=1,
+            )
+            src_dir = work / "src"
+            doc_limit = max(SUGGEST_DOC_LIMIT, len(cleaned))
+
+            if len(cleaned) == 1 and _looks_like_hf_dataset(cleaned[0]):
+                logger.info("suggest: loading HF dataset limit={}", doc_limit)
+                ready = InstructPairDetection(already_instruct=False)
+                documents, _, _ = load_source_documents(
+                    config,
+                    download_dir=src_dir,
+                    limit=doc_limit,
+                )
+            else:
+                logger.info("suggest: materializing sources once")
+                local_path = materialize_sources(cleaned, src_dir)
+                logger.info("suggest: detecting already-instruct format")
+                ready = _detect_ready_instruct(
+                    cleaned,
+                    download_dir=src_dir,
+                    local_path=local_path,
+                )
+                if ready.already_instruct:
+                    rows = int(ready.row_count or 0)
+                    logger.info(
+                        "suggest: already-instruct rows={} instruction={} output={}",
+                        rows,
+                        ready.instruction_field,
+                        ready.output_field,
+                    )
+                    if rows < MIN_STRUCTURE_ROWS:
+                        raise StructureSourceTooSmallError(INSTRUCT_TOO_SMALL_MESSAGE)
+                    return SuggestRowsResult(
+                        suggested_rows=rows,
+                        personas=[],
+                        page_count=None,
+                        pool_sizes={},
+                        dataset_profile=None,
+                        already_instruct=True,
+                        instruction_field=ready.instruction_field,
+                        output_field=ready.output_field,
+                        row_count=rows,
+                    )
+                logger.info("suggest: loading local documents limit={}", doc_limit)
+                load_root = local_path if local_path.is_dir() or len(cleaned) == 1 else src_dir
+                documents, _ = load_local_documents(
+                    load_root,
+                    limit=doc_limit,
+                    seed=config.seed,
+                    schema_sample_rows=config.schema_sample_rows,
+                )
+
+            if not documents:
+                raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
+
+            total_chars = _total_chars(documents)
+            logger.info("suggest: loaded docs={} chars={}", len(documents), total_chars)
+            if total_chars < MIN_STRUCTURE_CHARS:
+                raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
+
+            analysis = documents[: min(2, len(documents))]
+            engine = backend or build_default_backend(
+                config.model,
+                max_input_tokens=config.max_input_tokens,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                top_k=config.top_k,
+                seed=config.seed,
+            )
+
+            # One LLM skim call for profile + DS personas (quality-critical path).
             logger.info(
-                "suggest: already-instruct rows={} instruction={} output={}",
-                rows,
-                ready.instruction_field,
-                ready.output_field,
+                "suggest: inferring dataset profile + personas from {} analysis doc(s)",
+                len(analysis),
             )
-            if rows < MIN_STRUCTURE_ROWS:
-                raise StructureSourceTooSmallError(INSTRUCT_TOO_SMALL_MESSAGE)
-            return SuggestRowsResult(
-                suggested_rows=rows,
-                personas=[],
-                page_count=None,
-                pool_sizes={},
-                dataset_profile=None,
-                already_instruct=True,
-                instruction_field=ready.instruction_field,
-                output_field=ready.output_field,
-                row_count=rows,
-            )
+            try:
+                profile, extras = infer_profile_and_extra_personas_fast(
+                    engine,
+                    analysis,
+                    max_inferred=MAX_INFERRED_PERSONAS,
+                )
+                logger.info("suggest: fast profile ok extras={}", len(extras))
+            except Exception as exc:
+                logger.warning("suggest: fast profile failed ({}), falling back", type(exc).__name__)
+                profile = infer_dataset_profile(engine, analysis, sample_docs=1)
+                extras = []
+                try:
+                    extras = infer_personas_from_profile(
+                        engine, profile, maximum=MAX_INFERRED_PERSONAS
+                    )
+                except Exception as persona_exc:
+                    logger.warning(
+                        "suggest: profile-persona fallback failed ({})",
+                        type(persona_exc).__name__,
+                    )
+                    extras = []
 
-        config = StructureJobConfig(
-            source=cleaned[0],
-            sources=cleaned,
-            output_dir=work,
-            num_rows=1,
-        )
-        logger.info("suggest: loading source documents limit={}", max(SUGGEST_DOC_LIMIT, len(cleaned)))
-        documents, _, _ = load_source_documents(
-            config,
-            download_dir=work / "src",
-            limit=max(SUGGEST_DOC_LIMIT, len(cleaned)),
-        )
-        if not documents:
-            raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
-
-        total_chars = _total_chars(documents)
-        logger.info("suggest: loaded docs={} chars={}", len(documents), total_chars)
-        if total_chars < MIN_STRUCTURE_CHARS:
-            raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
-
-        analysis = documents[: min(2, len(documents))]
-        engine = backend or build_default_backend(
-            config.model,
-            max_input_tokens=config.max_input_tokens,
-            temperature=config.temperature,
-            top_p=config.top_p,
-            top_k=config.top_k,
-            seed=config.seed,
-        )
-
-        # Profile/personas first (small skim), then parse one doc at a time for capacity.
-        # Avoid holding every DocumentTree (+ duplicated text) in RAM at once.
-        logger.info("suggest: inferring dataset profile + personas from {} analysis doc(s)", len(analysis))
-        try:
-            profile, extras = infer_profile_and_extra_personas_fast(
+            personas = build_default_personas(
                 engine,
                 analysis,
-                max_inferred=MAX_INFERRED_PERSONAS,
+                dataset_profile=profile,
+                infer_extra=True,
+                inferred=extras,
             )
-            logger.info("suggest: fast profile ok extras={}", len(extras))
-        except Exception as exc:
-            logger.warning("suggest: fast profile failed ({}), falling back", type(exc).__name__)
-            profile = infer_dataset_profile(engine, analysis, sample_docs=1)
-            extras = []
-            try:
-                extras = infer_personas_from_profile(engine, profile, maximum=MAX_INFERRED_PERSONAS)
-            except Exception as persona_exc:
-                logger.warning("suggest: profile-persona fallback failed ({})", type(persona_exc).__name__)
-                extras = []
-
-        personas = build_default_personas(
-            engine,
-            analysis,
-            dataset_profile=profile,
-            infer_extra=True,
-            inferred=extras,
-        )
-        logger.info(
-            "suggest: personas={} names={}",
-            len(personas),
-            [p.name for p in personas],
-        )
-
-        capacity = 0
-        pool_sizes: dict[str, int] = {}
-        for index, document in enumerate(documents, start=1):
-            try:
-                tree = parse_document(document)
-            except Exception as exc:
-                logger.warning(
-                    "suggest: parse failed doc={} ({})",
-                    document.doc_id,
-                    type(exc).__name__,
-                )
-                continue
-            part_capacity, part_pools = estimate_generation_capacity(
-                tree, personas, dataset_profile=profile
-            )
-            capacity += part_capacity
-            for name, size in part_pools.items():
-                pool_sizes[name] = pool_sizes.get(name, 0) + size
             logger.info(
-                "suggest: capacity doc={}/{} id={} part={} total={}",
-                index,
-                len(documents),
-                document.doc_id,
-                part_capacity,
+                "suggest: personas={} names={}",
+                len(personas),
+                [p.name for p in personas],
+            )
+
+            # Parse only the analysis skim docs, then extrapolate capacity by char ratio.
+            # Avoids building full chunk pools for every loaded document.
+            sample_capacity = 0
+            pool_sizes: dict[str, int] = {}
+            for document in analysis:
+                try:
+                    tree = parse_document(document)
+                except Exception as exc:
+                    logger.warning(
+                        "suggest: parse failed doc={} ({})",
+                        document.doc_id,
+                        type(exc).__name__,
+                    )
+                    continue
+                part_capacity, part_pools = estimate_generation_capacity(
+                    tree, personas, dataset_profile=profile
+                )
+                sample_capacity += part_capacity
+                for name, size in part_pools.items():
+                    pool_sizes[name] = pool_sizes.get(name, 0) + size
+                del tree
+
+            analysis_chars = max(1, _total_chars(analysis))
+            extrapolated = int(sample_capacity * (total_chars / analysis_chars))
+            char_floor = _estimate_capacity_from_chars(total_chars, n_personas=len(personas))
+            capacity = max(extrapolated, char_floor, sample_capacity)
+            logger.info(
+                "suggest: capacity sample={} extrapolated={} char_floor={} final={}",
+                sample_capacity,
+                extrapolated,
+                char_floor,
                 capacity,
             )
-            del tree
 
-        if capacity < MIN_STRUCTURE_ROWS:
-            raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
+            if capacity < MIN_STRUCTURE_ROWS:
+                raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
 
-        page_count = _estimate_page_count(documents)
-        logger.info(
-            "suggest: done suggested_rows={} page_count={} pool_sizes={}",
-            capacity,
-            page_count,
-            pool_sizes,
-        )
-        return SuggestRowsResult(
-            suggested_rows=int(capacity),
-            personas=personas,
-            page_count=page_count,
-            pool_sizes=pool_sizes,
-            dataset_profile=profile,
-            already_instruct=False,
-            row_count=None,
-        )
+            page_count = _estimate_page_count(documents)
+            logger.info(
+                "suggest: done suggested_rows={} page_count={} pool_sizes={}",
+                capacity,
+                page_count,
+                pool_sizes,
+            )
+            return SuggestRowsResult(
+                suggested_rows=int(capacity),
+                personas=personas,
+                page_count=page_count,
+                pool_sizes=pool_sizes,
+                dataset_profile=profile,
+                already_instruct=False,
+                row_count=None,
+            )
     except Exception as exc:
         logger.exception("suggest: failed ({})", type(exc).__name__)
         raise
