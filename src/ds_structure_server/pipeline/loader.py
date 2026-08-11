@@ -378,21 +378,29 @@ def load_hf_documents_isolated(
             command.extend(("--metadata-column", column))
         subprocess.run(command, check=True)
 
-        lines = payload_path.read_text().splitlines()
-        if not lines:
-            raise ValueError("Hugging Face source worker returned no schema or documents")
-        schema = DiscoveredSchema.from_dict(json.loads(lines[0])["schema"])
-        documents = [
-            SourceDocument(
-                doc_id=value["doc_id"],
-                text=value["text"],
-                title=value["title"],
-                metadata=value.get("metadata", {}),
-            )
-            for line in lines[1:]
-            if (value := json.loads(line))
-        ]
-        return documents, schema
+        lines_iter = payload_path.open("r", encoding="utf-8")
+        try:
+            first = next(lines_iter, None)
+            if not first:
+                raise ValueError("Hugging Face source worker returned no schema or documents")
+            schema = DiscoveredSchema.from_dict(json.loads(first)["schema"])
+            documents: list[SourceDocument] = []
+            for line in lines_iter:
+                text = line.strip()
+                if not text:
+                    continue
+                value = json.loads(text)
+                documents.append(
+                    SourceDocument(
+                        doc_id=value["doc_id"],
+                        text=_truncate_chars(value["text"]),
+                        title=value["title"],
+                        metadata=value.get("metadata", {}),
+                    )
+                )
+            return documents, schema
+        finally:
+            lines_iter.close()
 
 
 _DOCUMENT_SUFFIXES = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf", ".docx"}
@@ -400,9 +408,13 @@ _STRUCTURED_SUFFIXES = {".json", ".jsonl", ".csv"}
 _ARCHIVE_SUFFIXES = {".zip"}
 _MIN_PDF_CHARS_PER_PAGE = 40
 _MIN_PDF_NONEMPTY_PAGE_RATIO = 0.2
-# Keep OCR memory-bounded: page-at-a-time + modest DPI/page cap (small hosts ~4GiB).
+# Keep OCR / PDF / document loads memory-bounded (small hosts ~4GiB).
 _DEFAULT_OCR_DPI = int(os.getenv("STRUCTURE_OCR_DPI", "150"))
 _DEFAULT_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_OCR_MAX_PAGES", "40"))
+_DEFAULT_NATIVE_PDF_MAX_PAGES = int(os.getenv("STRUCTURE_PDF_MAX_PAGES", "80"))
+_MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_MAX_DOCUMENT_CHARS", "500000"))
+_MAX_STRUCTURED_FILE_BYTES = int(os.getenv("STRUCTURE_MAX_STRUCTURED_FILE_BYTES", str(32 * 1024 * 1024)))
+_MAX_ZIP_UNCOMPRESSED_BYTES = int(os.getenv("STRUCTURE_MAX_ZIP_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
 
 
 def _safe_extract_zip(zip_path: Path, destination: Path) -> Path:
@@ -411,6 +423,7 @@ def _safe_extract_zip(zip_path: Path, destination: Path) -> Path:
 
     destination.mkdir(parents=True, exist_ok=True)
     dest_root = destination.resolve()
+    uncompressed = 0
     with zipfile.ZipFile(zip_path, "r") as archive:
         for info in archive.infolist():
             if info.is_dir():
@@ -418,12 +431,18 @@ def _safe_extract_zip(zip_path: Path, destination: Path) -> Path:
             member = Path(info.filename)
             if member.is_absolute() or ".." in member.parts:
                 continue
+            size = int(info.file_size or 0)
+            uncompressed += size
+            if uncompressed > _MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise ValueError(
+                    f"Zip uncompressed size exceeds {_MAX_ZIP_UNCOMPRESSED_BYTES // (1024 * 1024)}MB: {zip_path}"
+                )
             target = (destination / member).resolve()
             if not str(target).startswith(str(dest_root)):
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(info) as src, target.open("wb") as out:
-                shutil.copyfileobj(src, out)
+                shutil.copyfileobj(src, out, length=1024 * 64)
     return destination
 
 
@@ -431,14 +450,39 @@ def _normalize_extracted_text(text: str) -> str:
     return "\n\n".join(part.strip() for part in text.splitlines() if part.strip())
 
 
-def _pdf_native_text(path: Path) -> tuple[str, int]:
+def _truncate_chars(text: str, limit: int = _MAX_DOCUMENT_CHARS) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[:limit]
+
+
+def _pdf_native_text(
+    path: Path,
+    *,
+    max_pages: int = _DEFAULT_NATIVE_PDF_MAX_PAGES,
+    max_chars: int = _MAX_DOCUMENT_CHARS,
+) -> tuple[str, int]:
     from pypdf import PdfReader
 
     reader = PdfReader(path)
-    pages = [(page.extract_text() or "").strip() for page in reader.pages]
-    normalized = [_normalize_extracted_text(page) for page in pages if page.strip()]
+    total_pages = len(reader.pages)
+    limit = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+    parts: list[str] = []
+    used = 0
+    for index in range(limit):
+        raw = (reader.pages[index].extract_text() or "").strip()
+        normalized = _normalize_extracted_text(raw)
+        if not normalized:
+            continue
+        if max_chars > 0 and used + len(normalized) > max_chars:
+            remaining = max_chars - used
+            if remaining > 0:
+                parts.append(normalized[:remaining])
+            break
+        parts.append(normalized)
+        used += len(normalized)
     # Keep page boundaries for chunk_level=page sampling.
-    return "\f".join(normalized), len(pages)
+    return "\f".join(parts), total_pages
 
 
 def _pdf_text_is_usable(text: str, page_count: int) -> bool:
@@ -530,27 +574,108 @@ def _read_document(path: Path) -> str:
     if suffix == ".docx":
         from docx import Document
 
-        return "\n\n".join(paragraph.text for paragraph in Document(path).paragraphs)
-    return path.read_text(errors="replace")
+        parts: list[str] = []
+        used = 0
+        for paragraph in Document(path).paragraphs:
+            text = (paragraph.text or "").strip()
+            if not text:
+                continue
+            if used + len(text) + 2 > _MAX_DOCUMENT_CHARS:
+                remaining = _MAX_DOCUMENT_CHARS - used
+                if remaining > 0:
+                    parts.append(text[:remaining])
+                break
+            parts.append(text)
+            used += len(text) + 2
+        return "\n\n".join(parts)
+    # Bound plain-text / HTML reads without slurping multi-hundred-MB files.
+    chunks: list[str] = []
+    used = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        while used < _MAX_DOCUMENT_CHARS:
+            block = handle.read(min(64 * 1024, _MAX_DOCUMENT_CHARS - used))
+            if not block:
+                break
+            chunks.append(block)
+            used += len(block)
+    return "".join(chunks)
 
 
-def _structured_rows(path: Path) -> list[dict[str, Any]]:
+def iter_structured_rows(path: Path, *, max_rows: int | None = None) -> Iterator[dict[str, Any]]:
+    """Yield structured rows without requiring the whole file in memory (jsonl/csv)."""
     suffix = path.suffix.casefold()
+    yielded = 0
     if suffix == ".jsonl":
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if max_rows is not None and yielded >= max_rows:
+                    return
+                text = line.strip()
+                if not text:
+                    continue
+                value = json.loads(text)
+                if isinstance(value, dict):
+                    yield value
+                    yielded += 1
+        return
     if suffix == ".csv":
-        with path.open(newline="") as handle:
-            return list(DictReader(handle))
-    value = json.loads(path.read_text())
+        with path.open(newline="", encoding="utf-8", errors="replace") as handle:
+            for row in DictReader(handle):
+                if max_rows is not None and yielded >= max_rows:
+                    return
+                if isinstance(row, dict):
+                    yield row
+                    yielded += 1
+        return
+    # JSON arrays/objects: size-capped full parse (true streaming needs ijson).
+    if path.stat().st_size > _MAX_STRUCTURED_FILE_BYTES:
+        raise ValueError(
+            f"Structured JSON source exceeds {_MAX_STRUCTURED_FILE_BYTES // (1024 * 1024)}MB: {path}"
+        )
+    value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    rows: list[dict[str, Any]]
     if isinstance(value, list):
-        return [row for row in value if isinstance(row, dict)]
-    if isinstance(value, dict):
+        rows = [row for row in value if isinstance(row, dict)]
+    elif isinstance(value, dict):
+        rows = []
         for key in ("rows", "records", "documents", "data", "items", "results"):
             nested = value.get(key)
             if isinstance(nested, list) and all(isinstance(row, dict) for row in nested):
-                return nested
-        return [value]
-    raise ValueError(f"Structured source must contain objects: {path}")
+                rows = nested
+                break
+        if not rows:
+            rows = [value]
+    else:
+        raise ValueError(f"Structured source must contain objects: {path}")
+    for row in rows:
+        if max_rows is not None and yielded >= max_rows:
+            return
+        yield row
+        yielded += 1
+
+
+def sample_and_count_structured(
+    path: Path,
+    *,
+    sample_limit: int = 200,
+) -> tuple[list[dict[str, Any]], int]:
+    """Stream structured sources: keep a small sample and an exact/cheap row count."""
+    suffix = path.suffix.casefold()
+    sample: list[dict[str, Any]] = []
+    count = 0
+    if suffix in {".jsonl", ".csv"}:
+        for row in iter_structured_rows(path):
+            count += 1
+            if len(sample) < sample_limit:
+                sample.append(row)
+        return sample, count
+    # JSON: one bounded parse; sample + full count from the in-memory list once.
+    rows = list(iter_structured_rows(path))
+    return rows[:sample_limit], len(rows)
+
+
+def _structured_rows(path: Path, *, max_rows: int | None = None) -> list[dict[str, Any]]:
+    return list(iter_structured_rows(path, max_rows=max_rows))
 
 
 def load_local_documents(
@@ -590,7 +715,7 @@ def load_local_documents(
                 break
             suffix = file.suffix.casefold()
             if suffix in _DOCUMENT_SUFFIXES:
-                text = _read_document(file)
+                text = _truncate_chars(_read_document(file))
                 if text.strip():
                     documents.append(
                         SourceDocument(
@@ -629,7 +754,7 @@ def load_local_documents(
 
     suffix = path.suffix.casefold()
     if suffix in _DOCUMENT_SUFFIXES:
-        text = _read_document(path)
+        text = _truncate_chars(_read_document(path))
         schema = DiscoveredSchema(
             source=str(path),
             source_kind="document",
@@ -644,7 +769,7 @@ def load_local_documents(
     if suffix not in _STRUCTURED_SUFFIXES:
         raise ValueError(f"Unsupported local source type: {suffix or '<none>'}")
 
-    rows = _structured_rows(path)
+    rows = _structured_rows(path, max_rows=max(limit, schema_sample_rows))
     sample = rows[:schema_sample_rows]
     schema = discover_schema(
         sample,

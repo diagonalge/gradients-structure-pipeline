@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import re
 import threading
@@ -1123,6 +1124,10 @@ def _candidate_lines(text: str) -> list[str]:
     ]
 
 
+
+_MAX_CHUNK_POOL = int(os.environ.get("STRUCTURE_MAX_CHUNK_POOL", "1500"))
+
+
 def list_candidate_chunks(
     tree: DocumentTree,
     persona: Persona,
@@ -1133,6 +1138,10 @@ def list_candidate_chunks(
         raise ValueError("Document has no useful sections")
     level = persona.chunk_level
     chunks: list[SampledChunk] = []
+
+    def _append(chunk: SampledChunk) -> bool:
+        chunks.append(chunk)
+        return len(chunks) < _MAX_CHUNK_POOL
 
     if level == "document":
         text = tree.cleaned_text[:max_context_chars]
@@ -1145,7 +1154,7 @@ def list_candidate_chunks(
             text = page_text[:max_context_chars]
             if is_prompt_only_chunk(text) or not is_high_value_chunk(text, minimum_chars=120):
                 continue
-            chunks.append(
+            if not _append(
                 SampledChunk(
                     text,
                     text,
@@ -1155,7 +1164,8 @@ def list_candidate_chunks(
                     page_start,
                     page_start + len(text),
                 )
-            )
+            ):
+                break
         if not chunks:
             raise ValueError("Document has no usable pages for generation")
         return chunks
@@ -1169,7 +1179,7 @@ def list_candidate_chunks(
             text = section.text[:max_context_chars]
             if is_prompt_only_chunk(text) or not is_high_value_chunk(text, minimum_chars=160):
                 continue
-            chunks.append(
+            if not _append(
                 SampledChunk(
                     text,
                     text,
@@ -1179,12 +1189,15 @@ def list_candidate_chunks(
                     section.start,
                     section.start + len(text),
                 )
-            )
+            ):
+                break
         if not chunks:
             raise ValueError("No high-value section remained after filtering")
         return chunks
 
     for section in sections:
+        if len(chunks) >= _MAX_CHUNK_POOL:
+            break
         if level == "line":
             lines = _candidate_lines(section.text)
             for index, target in enumerate(lines):
@@ -1193,7 +1206,7 @@ def list_candidate_chunks(
                 window = "\n".join(lines[left:right])[: max(500, min(1_500, max_context_chars))]
                 line_offset = section.text.find(target)
                 line_start = section.start + max(line_offset, 0)
-                chunks.append(
+                if not _append(
                     SampledChunk(
                         window,
                         target,
@@ -1203,7 +1216,8 @@ def list_candidate_chunks(
                         line_start,
                         line_start + len(target),
                     )
-                )
+                ):
+                    break
             continue
 
         useful_paragraphs = _candidate_paragraphs(section)
@@ -1213,6 +1227,8 @@ def list_candidate_chunks(
         if level == "needle":
             envelope = section.text[:max_context_chars]
             for paragraph in useful_paragraphs:
+                if len(chunks) >= _MAX_CHUNK_POOL:
+                    break
                 paragraph_offset = section.text.find(paragraph)
                 start = section.start + max(paragraph_offset, 0)
                 sentences = [
@@ -1221,7 +1237,7 @@ def list_candidate_chunks(
                     if is_high_value_chunk(sentence, minimum_chars=40)
                 ] or [paragraph]
                 for target in sentences:
-                    chunks.append(
+                    if not _append(
                         SampledChunk(
                             envelope,
                             target,
@@ -1231,7 +1247,8 @@ def list_candidate_chunks(
                             start,
                             start + len(paragraph),
                         )
-                    )
+                    ):
+                        break
             continue
 
         # paragraph (default for detail-researcher)
@@ -1241,6 +1258,8 @@ def list_candidate_chunks(
         if not window_paragraphs:
             continue
         for paragraph in useful_paragraphs:
+            if len(chunks) >= _MAX_CHUNK_POOL:
+                break
             if paragraph not in window_paragraphs:
                 continue
             paragraph_offset = section.text.find(paragraph)
@@ -1252,7 +1271,7 @@ def list_candidate_chunks(
             )
             if is_prompt_only_chunk(window) or not is_high_value_chunk(window, minimum_chars=120):
                 continue
-            chunks.append(
+            if not _append(
                 SampledChunk(
                     window,
                     paragraph[:max_context_chars],
@@ -1262,7 +1281,8 @@ def list_candidate_chunks(
                     start,
                     start + len(paragraph),
                 )
-            )
+            ):
+                break
 
     if not chunks:
         raise ValueError(f"No usable {level} chunks remained after filtering")

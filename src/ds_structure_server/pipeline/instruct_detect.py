@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .loader import _STRUCTURED_SUFFIXES, _structured_rows
+from .loader import _STRUCTURED_SUFFIXES, sample_and_count_structured
 
 # Prefer stronger / more specific names first.
 INSTRUCTION_ALIASES = (
@@ -178,17 +178,16 @@ def detect_instruct_pair_from_path(path: Path, *, sample_limit: int = 200) -> In
     if suffix not in _STRUCTURED_SUFFIXES:
         return InstructPairDetection(already_instruct=False)
     try:
-        rows = _structured_rows(path)
+        sample, row_count = sample_and_count_structured(path, sample_limit=sample_limit)
     except Exception:
         return InstructPairDetection(already_instruct=False)
-    sample = rows[:sample_limit] if sample_limit > 0 else rows
     detected = detect_instruct_pair_from_rows(sample)
     if detected.already_instruct:
         return InstructPairDetection(
             already_instruct=True,
             instruction_field=detected.instruction_field,
             output_field=detected.output_field,
-            row_count=len(rows),
+            row_count=row_count,
             format=detected.format,
         )
-    return InstructPairDetection(already_instruct=False, row_count=len(rows))
+    return InstructPairDetection(already_instruct=False, row_count=row_count)

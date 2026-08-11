@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -42,6 +41,8 @@ DEFAULT_GENERIC_PERSONA_NAMES = ["line-analyst", "summarizer", "needle", "detail
 MAX_INFERRED_PERSONAS = 2
 MAX_STRUCTURE_SOURCES = 50
 MAX_STRUCTURE_TOTAL_BYTES = 200 * 1024 * 1024
+# Suggest / create-check only need enough text for capacity — not hundreds of docs.
+SUGGEST_DOC_LIMIT = int(os.getenv("STRUCTURE_SUGGEST_DOC_LIMIT", "32"))
 # Calibrated from UKSI (~15 pages / ~27k chars → ~524 capacity) → ~50k chars ≈ 1000 rows.
 MIN_STRUCTURE_CHARS = 50_000
 MIN_STRUCTURE_ROWS = 1_000
@@ -96,8 +97,8 @@ class StructureJobConfig:
     id_column: str | None = None
     title_column: str | None = None
     metadata_columns: tuple[str, ...] = ()
-    max_parse_rows: int = 1_000
-    persona_sample_docs: int = 50
+    max_parse_rows: int = 200
+    persona_sample_docs: int = 20
     chunk_level: ChunkLevel | None = None
     model: str = "Qwen/Qwen3-32B-TEE"
     temperature: float = 0.5
@@ -106,7 +107,7 @@ class StructureJobConfig:
     seed: int = 42
     workers: int = field(default_factory=_internal_workers)
     max_input_tokens: int = 16_000
-    shuffle_buffer: int = 1_000
+    shuffle_buffer: int = 256
     schema_sample_rows: int = 32
 
     def resolved_sources(self) -> list[str]:
@@ -170,12 +171,28 @@ def download_source_url(url: str, destination_dir: Path, *, index: int = 0) -> P
     if path.exists() or index:
         stem, suffix = path.stem, path.suffix
         path = destination_dir / f"{index:02d}_{stem}{suffix}"
-    with requests.get(url, stream=True, timeout=120, headers={"User-Agent": "structured-ds/0.1"}) as response:
-        response.raise_for_status()
-        with path.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=1024 * 64):
-                if chunk:
+    written = 0
+    try:
+        with requests.get(url, stream=True, timeout=120, headers={"User-Agent": "structured-ds/0.1"}) as response:
+            response.raise_for_status()
+            content_length = response.headers.get("Content-Length")
+            if content_length and content_length.isdigit() and int(content_length) > MAX_STRUCTURE_TOTAL_BYTES:
+                raise ValueError(
+                    f"Source exceeds {MAX_STRUCTURE_TOTAL_BYTES // (1024 * 1024)}MB limit: {url}"
+                )
+            with path.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 64):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > MAX_STRUCTURE_TOTAL_BYTES:
+                        raise ValueError(
+                            f"Source exceeds {MAX_STRUCTURE_TOTAL_BYTES // (1024 * 1024)}MB limit: {url}"
+                        )
                     handle.write(chunk)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
     if path.stat().st_size == 0:
         raise ValueError(f"Downloaded source was empty: {url}")
     return path
@@ -194,24 +211,9 @@ def _copy_local_into(destination_dir: Path, local_path: Path, *, index: int) -> 
 
 def _safe_extract_zip(zip_path: Path, destination: Path) -> Path:
     """Extract a zip into destination (no zip-slip). Nested .zip files are copied, not re-extracted."""
-    import zipfile
+    from .loader import _safe_extract_zip as _extract
 
-    destination.mkdir(parents=True, exist_ok=True)
-    dest_root = destination.resolve()
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        for info in archive.infolist():
-            if info.is_dir():
-                continue
-            member = Path(info.filename)
-            if member.is_absolute() or ".." in member.parts:
-                continue
-            target = (destination / member).resolve()
-            if not str(target).startswith(str(dest_root)):
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as src, target.open("wb") as out:
-                shutil.copyfileobj(src, out)
-    return destination
+    return _extract(zip_path, destination)
 
 
 def _expand_zip_sources(paths: list[Path]) -> list[Path]:
@@ -526,11 +528,10 @@ def suggest_structure_for_sources(
             output_dir=work,
             num_rows=1,
         )
-        # Load generously so multi-doc capacity is honest.
         documents, _, _ = load_source_documents(
             config,
             download_dir=work / "src",
-            limit=max(config.max_parse_rows, len(cleaned) * 20, 200),
+            limit=max(SUGGEST_DOC_LIMIT, len(cleaned)),
         )
         if not documents:
             raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
@@ -549,22 +550,21 @@ def suggest_structure_for_sources(
             seed=config.seed,
         )
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            trees_future = pool.submit(lambda: [parse_document(doc) for doc in documents])
+        # Profile/personas first (small skim), then parse one doc at a time for capacity.
+        # Avoid holding every DocumentTree (+ duplicated text) in RAM at once.
+        try:
+            profile, extras = infer_profile_and_extra_personas_fast(
+                engine,
+                analysis,
+                max_inferred=MAX_INFERRED_PERSONAS,
+            )
+        except Exception:
+            profile = infer_dataset_profile(engine, analysis, sample_docs=1)
+            extras = []
             try:
-                profile, extras = infer_profile_and_extra_personas_fast(
-                    engine,
-                    analysis,
-                    max_inferred=MAX_INFERRED_PERSONAS,
-                )
+                extras = infer_personas_from_profile(engine, profile, maximum=MAX_INFERRED_PERSONAS)
             except Exception:
-                profile = infer_dataset_profile(engine, analysis, sample_docs=1)
                 extras = []
-                try:
-                    extras = infer_personas_from_profile(engine, profile, maximum=MAX_INFERRED_PERSONAS)
-                except Exception:
-                    extras = []
-            trees = trees_future.result()
 
         personas = build_default_personas(
             engine,
@@ -576,11 +576,18 @@ def suggest_structure_for_sources(
 
         capacity = 0
         pool_sizes: dict[str, int] = {}
-        for tree in trees:
-            part_capacity, part_pools = estimate_generation_capacity(tree, personas, dataset_profile=profile)
+        for document in documents:
+            try:
+                tree = parse_document(document)
+            except Exception:
+                continue
+            part_capacity, part_pools = estimate_generation_capacity(
+                tree, personas, dataset_profile=profile
+            )
             capacity += part_capacity
             for name, size in part_pools.items():
                 pool_sizes[name] = pool_sizes.get(name, 0) + size
+            del tree
 
         if capacity < MIN_STRUCTURE_ROWS:
             raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
@@ -623,12 +630,12 @@ def assert_sources_ok_for_structure_job(sources: list[str]) -> None:
         documents, _, _ = load_source_documents(
             config,
             download_dir=work / "src",
-            limit=max(200, len(cleaned) * 20),
+            limit=max(SUGGEST_DOC_LIMIT, len(cleaned)),
         )
         if not documents or _total_chars(documents) < MIN_STRUCTURE_CHARS:
             raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
 
-        # Cheap capacity floor using default personas (no LLM) — parse only.
+        # Cheap capacity floor using default personas (no LLM) — parse one at a time.
         personas = generic_builtin_personas()
         capacity = 0
         for document in documents:
@@ -638,6 +645,7 @@ def assert_sources_ok_for_structure_job(sources: list[str]) -> None:
                 continue
             part, _ = estimate_generation_capacity(tree, personas, dataset_profile=None)
             capacity += part
+            del tree
         if capacity < MIN_STRUCTURE_ROWS:
             raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
     finally:
@@ -767,15 +775,17 @@ def run_structure_job(
 
     combined_path = _combined_train_path(output_dir)
     combined_path.parent.mkdir(parents=True, exist_ok=True)
-    with combined_path.open("w", encoding="utf-8") as handle:
+    with combined_path.open("wb") as handle:
         wrote = False
         for path in persona_train_paths.values():
-            text = path.read_text(encoding="utf-8")
-            if not text.strip():
+            if not path.exists() or path.stat().st_size == 0:
                 continue
-            if not text.endswith("\n"):
-                text += "\n"
-            handle.write(text)
+            with path.open("rb") as src:
+                shutil.copyfileobj(src, handle, length=64 * 1024)
+            if handle.tell() > 0:
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.write(b"\n")
             wrote = True
     if not wrote:
         combined_path = None

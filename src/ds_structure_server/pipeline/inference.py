@@ -161,7 +161,8 @@ def extract_json(text: str) -> Any:
 
 
 def _default_llm_concurrency() -> int:
-    return 100
+    # Small hosts (~4GiB) cannot sustain dozens of concurrent LLM payloads.
+    return 4
 
 
 def _env_concurrency(*keys: str, default: int | None = None) -> int:
@@ -171,7 +172,7 @@ def _env_concurrency(*keys: str, default: int | None = None) -> int:
         if raw is None or not str(raw).strip():
             continue
         try:
-            return max(1, min(100, int(raw)))
+            return max(1, min(16, int(raw)))
         except ValueError:
             continue
     return fallback
