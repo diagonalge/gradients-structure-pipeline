@@ -36,15 +36,17 @@ def _now() -> str:
 def _on_progress(job_id: uuid.UUID, message: str, counts: dict[str, Any] | None = None) -> None:
     if is_cancelled(job_id):
         raise StructureJobCancelled("cancelled by user")
+    stage = (counts or {}).get("stage")
     level_error = "error" in message.lower() or message.startswith("fail")
     if level_error:
+        logger.error("job {} [{}]: {}", job_id, stage or "generate", message)
         job_store.append_unique_error(job_id, message)
         payload = dict(counts or {})
         payload.setdefault("stage", "generate")
         job_store.write_status(job_id, **payload)
         return
 
-    stage = (counts or {}).get("stage")
+    logger.info("job {} [{}]: {}", job_id, stage or "job", message)
     if stage == "generate" or "accepted " in message:
         fields = dict(counts or {})
         fields.setdefault("stage", "generate")
@@ -84,6 +86,14 @@ def _run_job(request: CreateJobRequest) -> None:
             records=0,
             failures=0,
             goal=request.num_rows,
+        )
+        logger.info(
+            "job {} running: sources={} num_rows={} chunk_level={} personas={}",
+            job_id,
+            len(request.sources),
+            request.num_rows,
+            request.chunk_level,
+            request.personas,
         )
         _on_progress(job_id, f"validating {len(request.sources)} source(s)", {"stage": "validate", "goal": request.num_rows})
 
@@ -236,4 +246,12 @@ def cancel_job(job_id: uuid.UUID) -> dict[str, Any] | None:
 
 
 def suggest(sources: list[str]) -> Any:
-    return suggest_structure_for_sources(sources)
+    logger.info("suggest request: sources={}", len(sources))
+    result = suggest_structure_for_sources(sources)
+    logger.info(
+        "suggest request done: suggested_rows={} already_instruct={} personas={}",
+        result.suggested_rows,
+        result.already_instruct,
+        [p.name for p in result.personas],
+    )
+    return result

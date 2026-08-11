@@ -5,6 +5,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
+from loguru import logger
 
 from ds_structure_server.auth import ServiceAuth
 from ds_structure_server import job_store
@@ -78,7 +79,16 @@ def healthz() -> dict[str, str]:
 def create_job(body: CreateJobRequest, _: ServiceAuth) -> CreateJobResponse:
     existing = job_store.read_status(body.job_id)
     if existing and existing.get("status") in {"pending", "running", "cancelling"}:
+        logger.info("create job {}: already {}", body.job_id, existing.get("status"))
         return CreateJobResponse(job_id=body.job_id, status=existing.get("status") or "pending", message="already running")
+    logger.info(
+        "create job {}: sources={} num_rows={} personas={} chunk_level={}",
+        body.job_id,
+        len(body.sources),
+        body.num_rows,
+        body.personas,
+        body.chunk_level,
+    )
     start_job_thread(body)
     return CreateJobResponse(job_id=body.job_id, status="pending")
 
@@ -97,6 +107,7 @@ def get_job(job_id: uuid.UUID, _: ServiceAuth) -> JobStatusResponse:
     include_in_schema=False,
 )
 def cancel_job_endpoint(job_id: uuid.UUID, _: ServiceAuth) -> JobStatusResponse:
+    logger.info("cancel job {}", job_id)
     payload = cancel_job(job_id)
     if payload is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -105,12 +116,20 @@ def cancel_job_endpoint(job_id: uuid.UUID, _: ServiceAuth) -> JobStatusResponse:
 
 @app.post("/v1/suggest-rows", response_model=SuggestRowsResponse)
 def suggest_rows(body: SuggestRowsRequest, _: ServiceAuth) -> SuggestRowsResponse:
+    logger.info("POST /v1/suggest-rows sources={}", len(body.sources))
     try:
         result = suggest(list(body.sources))
     except StructureSourceTooSmallError as exc:
+        logger.warning("suggest-rows rejected: {}", exc)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except ValueError as exc:
+        logger.warning("suggest-rows bad request: {}", exc)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    logger.info(
+        "POST /v1/suggest-rows done suggested_rows={} already_instruct={}",
+        result.suggested_rows,
+        result.already_instruct,
+    )
     return SuggestRowsResponse(
         suggested_rows=result.suggested_rows,
         personas=[SuggestedPersona(name=p.name, description=p.description) for p in result.personas],

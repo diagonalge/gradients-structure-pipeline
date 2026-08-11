@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from datasets import load_dataset
+from loguru import logger
 
 from .models import SourceDocument
 
@@ -515,6 +516,7 @@ def _ocr_pdf(
     page_texts: list[str] = []
     last_page = max_pages if max_pages > 0 else None
     page_num = 1
+    logger.info("ocr: start file={} dpi={} max_pages={}", path.name, dpi, max_pages)
     while last_page is None or page_num <= last_page:
         try:
             images = convert_from_path(
@@ -551,18 +553,26 @@ def _ocr_pdf(
         normalized = _normalize_extracted_text(raw)
         if normalized.strip():
             page_texts.append(normalized)
+        if page_num == 1 or page_num % 5 == 0:
+            logger.info("ocr: page {} done nonempty_pages={}", page_num, len(page_texts))
         page_num += 1
+    logger.info("ocr: finished pages_attempted={} nonempty={}", page_num - 1, len(page_texts))
     return "\f".join(page_texts)
 
 
 def _read_pdf(path: Path) -> str:
+    logger.info("pdf: native extract {}", path.name)
     text, page_count = _pdf_native_text(path)
     if _pdf_text_is_usable(text, page_count):
+        logger.info("pdf: native usable pages={} chars={}", page_count, len(text))
         return text
+    logger.info("pdf: native sparse pages={} chars={} → OCR fallback", page_count, len(text))
     ocr_text = _ocr_pdf(path)
     if ocr_text.strip():
+        logger.info("pdf: OCR ok chars={}", len(ocr_text))
         return ocr_text
     if text.strip():
+        logger.warning("pdf: OCR empty; using sparse native text chars={}", len(text))
         return text
     raise ValueError(f"Could not extract text from PDF via native parsing or OCR: {path}")
 

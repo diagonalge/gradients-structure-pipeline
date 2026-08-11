@@ -11,6 +11,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
+from loguru import logger
+
 from .inference import InferenceBackend
 from ds_structure_server.job_runtime import StructureJobCancelled
 from .models import (
@@ -2175,6 +2177,13 @@ def run_pipeline(
     goal = max(1, int(target_rows or examples_per_doc or 1))
     progress_every = max(1, min(50, goal // 20 or 1))
     last_reported = 0
+    logger.info(
+        "pipeline: start docs={} personas={} goal={} workers={}",
+        len(documents),
+        [p.name for p in personas],
+        goal,
+        worker_count,
+    )
 
     def _ensure_not_cancelled() -> None:
         if is_cancelled is not None and is_cancelled():
@@ -2182,8 +2191,6 @@ def run_pipeline(
 
     def _emit(message: str, *, error: bool = False) -> None:
         _ensure_not_cancelled()
-        if on_progress is None:
-            return
         payload = {
             "stage": "generate",
             "goal": goal,
@@ -2192,10 +2199,17 @@ def run_pipeline(
             "failures": counts["failures"],
             "skipped": counts["skipped"],
         }
+        # Prefer job-store callback logging (worker → nohup); fall back when no callback.
         if error:
-            on_progress(f"error: {message}", payload)
-        else:
+            if on_progress is not None:
+                on_progress(f"error: {message}", payload)
+            else:
+                logger.error("pipeline: {}", message)
+            return
+        if on_progress is not None:
             on_progress(message, payload)
+        else:
+            logger.info("pipeline: {}", message)
 
     for document in documents:
         if counts["records"] >= goal:
@@ -2422,4 +2436,5 @@ def run_pipeline(
             _emit(f"{type(exc).__name__} on document {document.doc_id}: {exc}", error=True)
 
     deduper.close()
+    logger.info("pipeline: finished counts={}", counts)
     return counts

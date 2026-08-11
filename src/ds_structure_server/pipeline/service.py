@@ -11,6 +11,7 @@ from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 
 import requests
+from loguru import logger
 
 from .inference import InferenceBackend, build_default_backend
 from .instruct_detect import InstructPairDetection, detect_instruct_pair_from_path
@@ -172,6 +173,7 @@ def download_source_url(url: str, destination_dir: Path, *, index: int = 0) -> P
         stem, suffix = path.stem, path.suffix
         path = destination_dir / f"{index:02d}_{stem}{suffix}"
     written = 0
+    logger.info("download: start url={}", url)
     try:
         with requests.get(url, stream=True, timeout=120, headers={"User-Agent": "structured-ds/0.1"}) as response:
             response.raise_for_status()
@@ -195,6 +197,7 @@ def download_source_url(url: str, destination_dir: Path, *, index: int = 0) -> P
         raise
     if path.stat().st_size == 0:
         raise ValueError(f"Downloaded source was empty: {url}")
+    logger.info("download: done path={} bytes={}", path.name, path.stat().st_size)
     return path
 
 
@@ -502,12 +505,20 @@ def suggest_structure_for_sources(
     if len(cleaned) > MAX_STRUCTURE_SOURCES:
         raise ValueError(f"At most {MAX_STRUCTURE_SOURCES} sources are allowed")
 
+    logger.info("suggest: start sources={} count={}", cleaned[:3], len(cleaned))
     work = Path(tempfile.mkdtemp(prefix="structure-suggest-"))
     try:
         detect_dir = work / "detect"
+        logger.info("suggest: detecting already-instruct format")
         ready = _detect_ready_instruct(cleaned, download_dir=detect_dir)
         if ready.already_instruct:
             rows = int(ready.row_count or 0)
+            logger.info(
+                "suggest: already-instruct rows={} instruction={} output={}",
+                rows,
+                ready.instruction_field,
+                ready.output_field,
+            )
             if rows < MIN_STRUCTURE_ROWS:
                 raise StructureSourceTooSmallError(INSTRUCT_TOO_SMALL_MESSAGE)
             return SuggestRowsResult(
@@ -528,6 +539,7 @@ def suggest_structure_for_sources(
             output_dir=work,
             num_rows=1,
         )
+        logger.info("suggest: loading source documents limit={}", max(SUGGEST_DOC_LIMIT, len(cleaned)))
         documents, _, _ = load_source_documents(
             config,
             download_dir=work / "src",
@@ -537,6 +549,7 @@ def suggest_structure_for_sources(
             raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
 
         total_chars = _total_chars(documents)
+        logger.info("suggest: loaded docs={} chars={}", len(documents), total_chars)
         if total_chars < MIN_STRUCTURE_CHARS:
             raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
 
@@ -552,18 +565,22 @@ def suggest_structure_for_sources(
 
         # Profile/personas first (small skim), then parse one doc at a time for capacity.
         # Avoid holding every DocumentTree (+ duplicated text) in RAM at once.
+        logger.info("suggest: inferring dataset profile + personas from {} analysis doc(s)", len(analysis))
         try:
             profile, extras = infer_profile_and_extra_personas_fast(
                 engine,
                 analysis,
                 max_inferred=MAX_INFERRED_PERSONAS,
             )
-        except Exception:
+            logger.info("suggest: fast profile ok extras={}", len(extras))
+        except Exception as exc:
+            logger.warning("suggest: fast profile failed ({}), falling back", type(exc).__name__)
             profile = infer_dataset_profile(engine, analysis, sample_docs=1)
             extras = []
             try:
                 extras = infer_personas_from_profile(engine, profile, maximum=MAX_INFERRED_PERSONAS)
-            except Exception:
+            except Exception as persona_exc:
+                logger.warning("suggest: profile-persona fallback failed ({})", type(persona_exc).__name__)
                 extras = []
 
         personas = build_default_personas(
@@ -573,13 +590,23 @@ def suggest_structure_for_sources(
             infer_extra=True,
             inferred=extras,
         )
+        logger.info(
+            "suggest: personas={} names={}",
+            len(personas),
+            [p.name for p in personas],
+        )
 
         capacity = 0
         pool_sizes: dict[str, int] = {}
-        for document in documents:
+        for index, document in enumerate(documents, start=1):
             try:
                 tree = parse_document(document)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "suggest: parse failed doc={} ({})",
+                    document.doc_id,
+                    type(exc).__name__,
+                )
                 continue
             part_capacity, part_pools = estimate_generation_capacity(
                 tree, personas, dataset_profile=profile
@@ -587,20 +614,38 @@ def suggest_structure_for_sources(
             capacity += part_capacity
             for name, size in part_pools.items():
                 pool_sizes[name] = pool_sizes.get(name, 0) + size
+            logger.info(
+                "suggest: capacity doc={}/{} id={} part={} total={}",
+                index,
+                len(documents),
+                document.doc_id,
+                part_capacity,
+                capacity,
+            )
             del tree
 
         if capacity < MIN_STRUCTURE_ROWS:
             raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
 
+        page_count = _estimate_page_count(documents)
+        logger.info(
+            "suggest: done suggested_rows={} page_count={} pool_sizes={}",
+            capacity,
+            page_count,
+            pool_sizes,
+        )
         return SuggestRowsResult(
             suggested_rows=int(capacity),
             personas=personas,
-            page_count=_estimate_page_count(documents),
+            page_count=page_count,
             pool_sizes=pool_sizes,
             dataset_profile=profile,
             already_instruct=False,
             row_count=None,
         )
+    except Exception as exc:
+        logger.exception("suggest: failed ({})", type(exc).__name__)
+        raise
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -670,13 +715,24 @@ def run_structure_job(
     def progress(message: str, counts: dict[str, Any] | None = None) -> None:
         if is_cancelled is not None and is_cancelled():
             raise StructureJobCancelled("cancelled by user")
+        stage = (counts or {}).get("stage")
         if on_progress is not None:
             on_progress(message, counts)
+        else:
+            logger.info("generate[{}]: {}", stage or "job", message)
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     download_dir = output_dir / "source_download"
 
+    logger.info(
+        "generate: start source={} num_rows={} workers={} chunk_level={} personas={}",
+        config.source,
+        config.num_rows,
+        config.workers,
+        config.chunk_level,
+        config.personas,
+    )
     progress("loading source documents", {"stage": "download", "goal": config.num_rows})
     documents, schema, dataset_id = load_source_documents(config, download_dir=download_dir)
     if not documents:
@@ -702,6 +758,7 @@ def run_structure_job(
     progress("resolving personas / dataset profile", {"stage": "profile", "goal": config.num_rows})
     if not config.personas:
         try:
+            logger.info("generate: inferring profile + personas (fast path)")
             dataset_profile, extras = infer_profile_and_extra_personas_fast(
                 engine,
                 analysis_documents,
@@ -714,7 +771,8 @@ def run_structure_job(
                 infer_extra=True,
                 inferred=extras,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("generate: fast profile failed ({}), falling back", type(exc).__name__)
             dataset_profile = infer_dataset_profile(engine, analysis_documents, sample_docs=1)
             personas = resolve_job_personas(
                 engine,
@@ -723,6 +781,7 @@ def run_structure_job(
                 dataset_profile=dataset_profile,
             )
     else:
+        logger.info("generate: resolving requested personas={}", config.personas)
         dataset_profile = infer_dataset_profile(engine, analysis_documents, sample_docs=1)
         personas = resolve_job_personas(
             engine,
@@ -767,11 +826,13 @@ def run_structure_job(
         is_cancelled=is_cancelled,
     )
 
+    logger.info("generate: combining persona train files")
     persona_train_paths = {
         persona.name: path
         for persona in personas
         if (path := _persona_train_path(output_dir, persona.name)).exists()
     }
+    logger.info("generate: persona train files={}", {name: str(path) for name, path in persona_train_paths.items()})
 
     combined_path = _combined_train_path(output_dir)
     combined_path.parent.mkdir(parents=True, exist_ok=True)
@@ -791,6 +852,7 @@ def run_structure_job(
         combined_path = None
 
     progress(f"generation finished: {counts}", {**counts, "stage": "generate", "goal": config.num_rows})
+    logger.info("generate: done dataset_id={} counts={} combined={}", dataset_id, counts, combined_path)
     return StructureJobResult(
         dataset_id=dataset_id,
         personas=personas,
