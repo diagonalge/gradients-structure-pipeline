@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 import random
 import subprocess
 import sys
@@ -399,8 +400,9 @@ _STRUCTURED_SUFFIXES = {".json", ".jsonl", ".csv"}
 _ARCHIVE_SUFFIXES = {".zip"}
 _MIN_PDF_CHARS_PER_PAGE = 40
 _MIN_PDF_NONEMPTY_PAGE_RATIO = 0.2
-_DEFAULT_OCR_DPI = 200
-_DEFAULT_OCR_MAX_PAGES = 200
+# Keep OCR memory-bounded: page-at-a-time + modest DPI/page cap (small hosts ~4GiB).
+_DEFAULT_OCR_DPI = int(os.getenv("STRUCTURE_OCR_DPI", "150"))
+_DEFAULT_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_OCR_MAX_PAGES", "40"))
 
 
 def _safe_extract_zip(zip_path: Path, destination: Path) -> Path:
@@ -465,25 +467,48 @@ def _ocr_pdf(
             f"(pytesseract + pdf2image). Missing while reading: {path}"
         ) from exc
 
-    try:
-        images = convert_from_path(
-            str(path),
-            dpi=dpi,
-            first_page=1,
-            last_page=max_pages if max_pages > 0 else None,
-        )
-    except (PDFInfoNotInstalledError, PDFPageCountError, OSError) as exc:
-        raise RuntimeError(
-            f"OCR fallback requires poppler (`pdftoppm`) to render PDF pages: {path}"
-        ) from exc
-
-    try:
-        page_texts = [pytesseract.image_to_string(image) for image in images]
-    except pytesseract.TesseractNotFoundError as exc:
-        raise RuntimeError(
-            f"OCR fallback requires the `tesseract` binary on PATH: {path}"
-        ) from exc
-    return "\f".join(_normalize_extracted_text(page) for page in page_texts if page.strip())
+    # Render + OCR one page at a time so peak RSS stays roughly constant.
+    page_texts: list[str] = []
+    last_page = max_pages if max_pages > 0 else None
+    page_num = 1
+    while last_page is None or page_num <= last_page:
+        try:
+            images = convert_from_path(
+                str(path),
+                dpi=dpi,
+                first_page=page_num,
+                last_page=page_num,
+                grayscale=True,
+                thread_count=1,
+            )
+        except (PDFInfoNotInstalledError, PDFPageCountError, OSError) as exc:
+            if page_texts:
+                break
+            raise RuntimeError(
+                f"OCR fallback requires poppler (`pdftoppm`) to render PDF pages: {path}"
+            ) from exc
+        except MemoryError:
+            break
+        if not images:
+            break
+        image = images[0]
+        try:
+            try:
+                raw = pytesseract.image_to_string(image)
+            except pytesseract.TesseractNotFoundError as exc:
+                raise RuntimeError(
+                    f"OCR fallback requires the `tesseract` binary on PATH: {path}"
+                ) from exc
+            except MemoryError:
+                break
+        finally:
+            image.close()
+            del images
+        normalized = _normalize_extracted_text(raw)
+        if normalized.strip():
+            page_texts.append(normalized)
+        page_num += 1
+    return "\f".join(page_texts)
 
 
 def _read_pdf(path: Path) -> str:
