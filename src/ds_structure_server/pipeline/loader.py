@@ -414,18 +414,51 @@ _MIN_PDF_CHARS_PER_PAGE = 40
 _MIN_PDF_NONEMPTY_PAGE_RATIO = 0.2
 # Defaults sized for a ~16 vCPU / 16 GiB structure worker.
 # 0 for page/char caps means "no limit" (process the full document).
-_DEFAULT_OCR_DPI = int(os.getenv("STRUCTURE_OCR_DPI", "120"))
+_DEFAULT_OCR_DPI = int(os.getenv("STRUCTURE_OCR_DPI", "100"))
 _DEFAULT_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_OCR_MAX_PAGES", "0"))
-_DEFAULT_OCR_WORKERS = max(1, int(os.getenv("STRUCTURE_OCR_WORKERS", "8")))
+_DEFAULT_OCR_WORKERS = max(1, int(os.getenv("STRUCTURE_OCR_WORKERS", "16")))
+# Keep each tesseract process single-threaded so STRUCTURE_OCR_WORKERS can saturate cores.
+_OCR_OMP_THREADS = max(1, int(os.getenv("STRUCTURE_OCR_OMP_THREADS", "1")))
 _DEFAULT_NATIVE_PDF_MAX_PAGES = int(os.getenv("STRUCTURE_PDF_MAX_PAGES", "0"))
 _MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_MAX_DOCUMENT_CHARS", "0"))
 _MAX_STRUCTURED_FILE_BYTES = int(os.getenv("STRUCTURE_MAX_STRUCTURED_FILE_BYTES", str(128 * 1024 * 1024)))
 _MAX_ZIP_UNCOMPRESSED_BYTES = int(os.getenv("STRUCTURE_MAX_ZIP_UNCOMPRESSED_BYTES", str(512 * 1024 * 1024)))
-# Suggest may still skim lighter; 0 = full document (same as generate on 16 GiB hosts).
-_SUGGEST_OCR_DPI = int(os.getenv("STRUCTURE_SUGGEST_OCR_DPI", "120"))
-_SUGGEST_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_SUGGEST_OCR_MAX_PAGES", "0"))
+# Suggest OCR skim for personas; capacity_chars is extrapolated to the full PDF.
+# Pages are sampled from the document interior (not prefix) to avoid front-matter bias.
+_SUGGEST_OCR_DPI = int(os.getenv("STRUCTURE_SUGGEST_OCR_DPI", "100"))
+_SUGGEST_OCR_MAX_PAGES = int(os.getenv("STRUCTURE_SUGGEST_OCR_MAX_PAGES", "32"))
 _SUGGEST_MAX_DOCUMENT_CHARS = int(os.getenv("STRUCTURE_SUGGEST_MAX_DOCUMENT_CHARS", "0"))
 _LIGHT_DOCUMENT_MODE: ContextVar[bool] = ContextVar("structure_light_document_mode", default=False)
+
+
+def _sample_page_numbers(
+    total_pages: int,
+    limit: int,
+    *,
+    seed: int | None = None,
+) -> list[int]:
+    """Pick up to ``limit`` 1-based pages, preferring interior over front/back matter."""
+    if total_pages <= 0:
+        return []
+    if limit <= 0 or limit >= total_pages:
+        return list(range(1, total_pages + 1))
+    rng = random.Random(seed if seed is not None else (total_pages * 1_000_003 + limit))
+    # Skip typical ProQuest / TOC / approval-sheet prefix and sparse trailing pages.
+    skip_front = min(max(5, total_pages // 10), max(0, total_pages - limit))
+    skip_back = min(max(2, total_pages // 20), max(0, total_pages - skip_front - limit))
+    lo = 1 + skip_front
+    hi = total_pages - skip_back
+    if hi < lo:
+        lo, hi = 1, total_pages
+    pool = list(range(lo, hi + 1))
+    if len(pool) >= limit:
+        return sorted(rng.sample(pool, limit))
+    chosen = set(pool)
+    remainder = [p for p in range(1, total_pages + 1) if p not in chosen]
+    need = limit - len(chosen)
+    if need > 0 and remainder:
+        chosen.update(rng.sample(remainder, min(need, len(remainder))))
+    return sorted(chosen)
 
 
 @contextmanager
@@ -492,7 +525,8 @@ def _pdf_native_text(
 ) -> tuple[str, int]:
     from pypdf import PdfReader
 
-    if _in_light_document_mode():
+    light = _in_light_document_mode()
+    if light:
         if _SUGGEST_OCR_MAX_PAGES > 0:
             max_pages = (
                 min(max_pages, _SUGGEST_OCR_MAX_PAGES) if max_pages > 0 else _SUGGEST_OCR_MAX_PAGES
@@ -505,10 +539,18 @@ def _pdf_native_text(
             )
     reader = PdfReader(path)
     total_pages = len(reader.pages)
-    limit = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+    if total_pages <= 0:
+        return "", 0
+    if max_pages <= 0:
+        page_indexes = list(range(total_pages))
+    elif light:
+        # Random interior pages for profile/persona skims (1-based → 0-based).
+        page_indexes = [n - 1 for n in _sample_page_numbers(total_pages, max_pages)]
+    else:
+        page_indexes = list(range(min(total_pages, max_pages)))
     parts: list[str] = []
     used = 0
-    for index in range(limit):
+    for index in page_indexes:
         raw = (reader.pages[index].extract_text() or "").strip()
         normalized = _normalize_extracted_text(raw)
         if not normalized:
@@ -540,6 +582,11 @@ def _pdf_page_count(path: Path) -> int:
     return len(PdfReader(path).pages)
 
 
+def _configure_ocr_runtime() -> None:
+    """Pin OpenMP threads so parallel page workers do not oversubscribe CPUs."""
+    os.environ["OMP_THREAD_LIMIT"] = str(_OCR_OMP_THREADS)
+
+
 def _ocr_one_page(
     path: Path,
     page_num: int,
@@ -550,6 +597,7 @@ def _ocr_one_page(
     import pytesseract
     from pdf2image import convert_from_path
 
+    _configure_ocr_runtime()
     images = convert_from_path(
         str(path),
         dpi=dpi,
@@ -575,7 +623,8 @@ def _ocr_pdf(
     dpi: int = _DEFAULT_OCR_DPI,
     max_pages: int = _DEFAULT_OCR_MAX_PAGES,
     workers: int = _DEFAULT_OCR_WORKERS,
-) -> str:
+) -> tuple[str, int, int]:
+    """OCR pages. Returns (text, pages_attempted, total_pages)."""
     if _in_light_document_mode():
         dpi = min(dpi, _SUGGEST_OCR_DPI)
         if _SUGGEST_OCR_MAX_PAGES > 0:
@@ -592,22 +641,29 @@ def _ocr_pdf(
             f"(pytesseract + pdf2image). Missing while reading: {path}"
         ) from exc
 
+    _configure_ocr_runtime()
     try:
         total_pages = _pdf_page_count(path)
     except Exception as exc:
         raise RuntimeError(f"Could not read PDF page count for OCR: {path}") from exc
     if total_pages <= 0:
-        return ""
-    last_page = total_pages if max_pages <= 0 else min(total_pages, max_pages)
-    page_numbers = list(range(1, last_page + 1))
+        return "", 0, 0
+    if max_pages <= 0:
+        page_numbers = list(range(1, total_pages + 1))
+    elif _in_light_document_mode():
+        page_numbers = _sample_page_numbers(total_pages, max_pages)
+    else:
+        page_numbers = list(range(1, min(total_pages, max_pages) + 1))
     worker_count = max(1, min(workers, len(page_numbers)))
     logger.info(
-        "ocr: start file={} dpi={} pages={}/{} workers={}",
+        "ocr: start file={} dpi={} pages={}/{} sampled={} workers={} omp_threads={}",
         path.name,
         dpi,
-        last_page,
+        len(page_numbers),
         total_pages,
+        page_numbers[:8] + (["…"] if len(page_numbers) > 8 else []),
         worker_count,
+        _OCR_OMP_THREADS,
     )
 
     results: dict[int, str] = {}
@@ -632,8 +688,8 @@ def _ocr_pdf(
                 if text.strip():
                     results[page_num] = text
                 done += 1
-                if done == 1 or done % 10 == 0 or done == last_page:
-                    logger.info("ocr: page {}/{} nonempty={}", done, last_page, len(results))
+                if done == 1 or done % 10 == 0 or done == len(page_numbers):
+                    logger.info("ocr: page {}/{} nonempty={}", done, len(page_numbers), len(results))
         else:
             with ThreadPoolExecutor(max_workers=worker_count) as pool:
                 futures = {pool.submit(_run, page_num): page_num for page_num in page_numbers}
@@ -642,11 +698,11 @@ def _ocr_pdf(
                     if text.strip():
                         results[page_num] = text
                     done += 1
-                    if done == 1 or done % 10 == 0 or done == last_page:
+                    if done == 1 or done % 10 == 0 or done == len(page_numbers):
                         logger.info(
                             "ocr: progress {}/{} nonempty={}",
                             done,
-                            last_page,
+                            len(page_numbers),
                             len(results),
                         )
     except MemoryError:
@@ -654,27 +710,52 @@ def _ocr_pdf(
 
     ordered = [results[i] for i in sorted(results)]
     logger.info("ocr: finished pages_attempted={} nonempty={}", done, len(ordered))
-    return "\f".join(ordered)
+    return "\f".join(ordered), done, total_pages
 
 
-def _read_pdf(path: Path) -> str:
+def _pdf_capacity_chars(sample_text: str, *, pages_attempted: int, total_pages: int) -> int:
+    """Extrapolate corpus size from an OCR skim so suggest row counts stay full-document."""
+    sample_chars = len((sample_text or "").replace("\f", ""))
+    if sample_chars <= 0:
+        return 0
+    if pages_attempted <= 0 or total_pages <= pages_attempted:
+        return sample_chars
+    return max(sample_chars, int(sample_chars * (total_pages / pages_attempted)))
+
+
+def _read_pdf(path: Path) -> tuple[str, dict[str, Any]]:
     logger.info("pdf: native extract {}", path.name)
     text, page_count = _pdf_native_text(path)
     if _pdf_text_is_usable(text, page_count):
-        logger.info("pdf: native usable pages={} chars={}", page_count, len(text))
-        return text
+        chars = len(text.replace("\f", ""))
+        logger.info("pdf: native usable pages={} chars={}", page_count, chars)
+        return text, {"page_count": page_count, "capacity_chars": chars}
     logger.info("pdf: native sparse pages={} chars={} → OCR fallback", page_count, len(text))
-    ocr_text = _ocr_pdf(path)
+    ocr_text, pages_attempted, total_pages = _ocr_pdf(path)
     if ocr_text.strip():
-        logger.info("pdf: OCR ok chars={}", len(ocr_text))
-        return ocr_text
+        capacity_chars = _pdf_capacity_chars(
+            ocr_text, pages_attempted=pages_attempted, total_pages=total_pages
+        )
+        logger.info(
+            "pdf: OCR ok sample_chars={} capacity_chars={} pages={}/{}",
+            len(ocr_text.replace("\f", "")),
+            capacity_chars,
+            pages_attempted,
+            total_pages,
+        )
+        return ocr_text, {
+            "page_count": total_pages,
+            "capacity_chars": capacity_chars,
+            "ocr_pages": pages_attempted,
+        }
     if text.strip():
         logger.warning("pdf: OCR empty; using sparse native text chars={}", len(text))
-        return text
+        return text, {"page_count": page_count, "capacity_chars": len(text.replace("\f", ""))}
     raise ValueError(f"Could not extract text from PDF via native parsing or OCR: {path}")
 
 
-def _read_document(path: Path) -> str:
+def _read_document(path: Path) -> tuple[str, dict[str, Any]]:
+    """Return (text, extract_metadata). capacity_chars is full-doc estimate when OCR is skimmed."""
     suffix = path.suffix.casefold()
     if suffix == ".pdf":
         return _read_pdf(path)
@@ -699,9 +780,11 @@ def _read_document(path: Path) -> str:
                 break
             parts.append(text)
             used += len(text) + 2
-        return "\n\n".join(parts)
+        joined = "\n\n".join(parts)
+        return joined, {"capacity_chars": len(joined)}
     if char_cap <= 0:
-        return path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return text, {"capacity_chars": len(text)}
     chunks: list[str] = []
     used = 0
     with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -711,7 +794,8 @@ def _read_document(path: Path) -> str:
                 break
             chunks.append(block)
             used += len(block)
-    return "".join(chunks)
+    text = "".join(chunks)
+    return text, {"capacity_chars": len(text)}
 
 
 def iter_structured_rows(path: Path, *, max_rows: int | None = None) -> Iterator[dict[str, Any]]:
@@ -828,14 +912,19 @@ def load_local_documents(
                 break
             suffix = file.suffix.casefold()
             if suffix in _DOCUMENT_SUFFIXES:
-                text = _truncate_chars(_read_document(file))
+                text, extract_meta = _read_document(file)
+                text = _truncate_chars(text)
                 if text.strip():
+                    meta = {"path": str(file), **extract_meta}
+                    # Truncation shrinks text; keep capacity_chars as the pre-truncate estimate.
+                    if "capacity_chars" not in extract_meta:
+                        meta["capacity_chars"] = len(text.replace("\f", ""))
                     documents.append(
                         SourceDocument(
                             doc_id=str(file.relative_to(path)),
                             text=text,
                             title=file.stem,
-                            metadata={"path": str(file)},
+                            metadata=meta,
                         )
                     )
                 continue
@@ -867,7 +956,11 @@ def load_local_documents(
 
     suffix = path.suffix.casefold()
     if suffix in _DOCUMENT_SUFFIXES:
-        text = _truncate_chars(_read_document(path))
+        text, extract_meta = _read_document(path)
+        text = _truncate_chars(text)
+        meta = {"path": str(path), **extract_meta}
+        if "capacity_chars" not in extract_meta:
+            meta["capacity_chars"] = len(text.replace("\f", ""))
         schema = DiscoveredSchema(
             source=str(path),
             source_kind="document",
@@ -878,7 +971,7 @@ def load_local_documents(
             sampled_rows=1,
             confidence=1.0,
         )
-        return [SourceDocument(str(path), text, path.stem, {"path": str(path)})], schema
+        return [SourceDocument(str(path), text, path.stem, meta)], schema
     if suffix not in _STRUCTURED_SUFFIXES:
         raise ValueError(f"Unsupported local source type: {suffix or '<none>'}")
 

@@ -29,11 +29,13 @@ STRUCTURE_DATA_DIR=/data/ds-structure
 STRUCTURE_MAX_JOBS=4
 OPENROUTER_API_KEY=...
 DS_STRUCTURE_WORKERS=100             # LLM concurrency (default 100)
-STRUCTURE_OCR_WORKERS=8              # parallel page OCR (default 8)
-STRUCTURE_OCR_DPI=120
-STRUCTURE_OCR_MAX_PAGES=0            # 0 = all pages
+STRUCTURE_OCR_WORKERS=16             # parallel page OCR (default 16; pair with OMP=1)
+STRUCTURE_OCR_DPI=100
+STRUCTURE_OCR_OMP_THREADS=1          # 1 thread per tesseract (avoid CPU oversubscribe)
+STRUCTURE_OCR_MAX_PAGES=0            # 0 = all pages (full generate)
 STRUCTURE_PDF_MAX_PAGES=0            # 0 = all pages (native text)
-STRUCTURE_SUGGEST_OCR_MAX_PAGES=0    # 0 = full docs on suggest too
+STRUCTURE_SUGGEST_OCR_MAX_PAGES=24   # persona skim; row capacity uses extrapolated chars
+STRUCTURE_SUGGEST_OCR_DPI=100
 S3_BUCKET_NAME=gradients
 S3_COMPATIBLE_ENDPOINT=...
 S3_COMPATIBLE_ACCESS_KEY=...

@@ -14,19 +14,122 @@ _NAMED_HEADING_RE = re.compile(
 )
 _SECTION_NUMBER_RE = re.compile(r"^\d+(?:\.\d+)+\s+\S+")
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
-_REFERENCE_HEADING_RE = re.compile(r"^(references|bibliography|works cited|table of contents|contents)$", re.IGNORECASE)
+# Navigational / bibliographic / admin headings — skip body under these.
+_NON_CONTENT_HEADING_RE = re.compile(
+    r"(?i)^(?:#+\s*)?(?:"
+    r"table of contents|contents|list of (?:figures|tables|illustrations|algorithms|abbreviations)|"
+    r"index|glossary|nomenclature|colophon|"
+    r"references|bibliography|works cited|further reading|"
+    r"acknowledg(?:e)?ments?|dedication|preface|foreword|"
+    r"copyright(?: page)?|license|permissions?|"
+    r"about the authors?|about this (?:book|document|guide)|"
+    r"revision history|document control|change log|version history|"
+    r"approval(?: sheet)?|candidate information|submission (?:guidelines?|requirements?|procedures?)|"
+    r"formatting (?:guidelines?|requirements?|instructions?)|"
+    r"information to all users|publisher(?:'s)? note"
+    r")\s*$"
+)
+_REFERENCE_HEADING_RE = _NON_CONTENT_HEADING_RE  # backward-compatible alias
 _BOILERPLATE_RE = re.compile(
     r"^(?:page\s+\d+(?:\s+of\s+\d+)?|copyright\b.*|all rights reserved\.?|https?://\S+)$",
     re.IGNORECASE,
 )
+# Lexical cues common to packaging / legal / TOC pages across publishers and formats.
+_NON_CONTENT_CUE_RE = re.compile(
+    r"(?i)\b(?:"
+    r"table of contents|list of (?:figures|tables|illustrations)|"
+    r"all rights reserved|copyright (?:©|\(c\)|notice)|creative commons|"
+    r"reproduced (?:with permission|by permission)|information to all users|"
+    r"approval sheet|candidate information|submission (?:guideline|requirement|procedure)|"
+    r"formatting (?:guideline|requirement|instruction)|document control|"
+    r"revision history|version history|change log|"
+    r"this (?:work|document|publication) is protected|"
+    r"no part of this (?:publication|work|document) may be|"
+    r"printed in the united states|\bissn\b|\bisbn\b"
+    r")\b"
+)
+_TOC_LEADER_RE = re.compile(r"\.{3,}|…{1,}|·{3,}|\s+\d{1,4}\s*$")
 _MIN_PARAGRAPH_CHARS = 200
+
+
+def is_non_content_heading(heading: str) -> bool:
+    """True for navigational/admin/bib headings that should not drive instruct pairs."""
+    value = (heading or "").strip().lstrip("#").strip()
+    if not value or len(value) > 160:
+        return False
+    return bool(_NON_CONTENT_HEADING_RE.match(value))
+
+
+def is_non_content_text(text: str, *, heading: str | None = None) -> bool:
+    """Generic detector for TOC, legal, packaging, and other non-substantive passages.
+
+    Uses structure + cue density rather than a single corpus-specific brand list, so it
+    applies across PDFs, handbooks, specs, and scraped docs.
+    """
+    value = (text or "").strip()
+    if not value:
+        return True
+    if heading and is_non_content_heading(heading):
+        return True
+
+    # Short banner / footer only.
+    if len(value) < 80 and (_BOILERPLATE_RE.match(value) or _NON_CONTENT_CUE_RE.search(value)):
+        return True
+
+    head = value[:1_200]
+    cue_hits = len(_NON_CONTENT_CUE_RE.findall(head))
+    if cue_hits >= 2 and len(value) < 4_000:
+        return True
+    if cue_hits >= 1 and len(value) < 600:
+        return True
+
+    lines = [ln.strip() for ln in value.splitlines() if ln.strip()]
+    short_ratio = 0.0
+    leader_ratio = 0.0
+    page_ratio = 0.0
+    if len(lines) >= 6:
+        short = sum(1 for ln in lines if len(ln) <= 60)
+        leaders = sum(1 for ln in lines if _TOC_LEADER_RE.search(ln))
+        pageish = sum(1 for ln in lines if re.search(r"\b\d{1,4}\s*$", ln) and len(ln) <= 80)
+        short_ratio = short / len(lines)
+        leader_ratio = leaders / len(lines)
+        page_ratio = pageish / len(lines)
+        # Classic TOC / index layout: many short lines with leaders or trailing page nums.
+        if short_ratio >= 0.7 and (leader_ratio >= 0.35 or page_ratio >= 0.45):
+            return True
+        if leader_ratio >= 0.5 and len(lines) >= 8:
+            return True
+
+    # High digit / low prose density (page lists, form fields, revision tables).
+    alpha = sum(ch.isalpha() for ch in value)
+    digit = sum(ch.isdigit() for ch in value)
+    alpha_ratio = alpha / max(len(value), 1)
+    digit_ratio = digit / max(len(value), 1)
+    if (
+        len(value) >= 200
+        and digit_ratio >= 0.28
+        and alpha_ratio < 0.40
+        and (cue_hits >= 1 or (len(lines) >= 8 and short_ratio >= 0.65))
+    ):
+        return True
+
+    words = re.findall(r"[A-Za-z]{3,}", value)
+    if len(words) >= 30:
+        unique = len({w.casefold() for w in words})
+        if unique / len(words) < 0.28 and cue_hits >= 1:
+            return True
+    return False
 
 
 def clean_document_text(raw_text: str) -> str:
     # Preserve PDF page breaks so chunk_level=page can sample real pages.
     if "\f" in raw_text:
-        pages = [clean_document_text(page) for page in raw_text.split("\f")]
-        return "\f".join(page for page in pages if page.strip())
+        pages = []
+        for page in raw_text.split("\f"):
+            cleaned = clean_document_text(page)
+            if cleaned.strip() and not is_non_content_text(cleaned):
+                pages.append(cleaned)
+        return "\f".join(pages)
 
     text = raw_text
     if re.search(r"<(?:html|body|p|div|h[1-6]|br|table)\b", text, re.IGNORECASE):
@@ -166,7 +269,7 @@ def parse_document(document: SourceDocument) -> DocumentTree:
             flush(cursor)
             heading = stripped.lstrip("#").strip()
             body_start = line_end + 1
-            skip_references = bool(_REFERENCE_HEADING_RE.match(heading))
+            skip_references = is_non_content_heading(heading)
         elif not skip_references and not _BOILERPLATE_RE.match(stripped):
             body_lines.append(line)
         cursor = line_end + 1
@@ -181,5 +284,14 @@ def parse_document(document: SourceDocument) -> DocumentTree:
             if paragraphs
             else []
         )
+
+    # Drop sections whose heading or body is packaging / TOC / legal-only.
+    filtered = tuple(
+        section
+        for section in sections
+        if not is_non_content_heading(section.title) and not is_non_content_text(section.text, heading=section.title)
+    )
+    if filtered:
+        sections = filtered
 
     return DocumentTree(document=document, cleaned_text=cleaned, sections=tuple(sections))

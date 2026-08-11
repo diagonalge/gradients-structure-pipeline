@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -47,6 +48,8 @@ DEFAULT_GENERIC_PERSONA_NAMES = ["line-analyst", "summarizer", "needle", "detail
 MAX_INFERRED_PERSONAS = 2
 MAX_STRUCTURE_SOURCES = 50
 MAX_STRUCTURE_TOTAL_BYTES = int(os.getenv("STRUCTURE_MAX_TOTAL_BYTES", str(512 * 1024 * 1024)))
+# How many documents to randomly sample for profile/persona inference.
+PROFILE_SAMPLE_DOCS = max(1, int(os.getenv("STRUCTURE_PROFILE_SAMPLE_DOCS", "4")))
 # Suggest / create-check defaults for ~16 vCPU / 16 GiB workers.
 SUGGEST_DOC_LIMIT = int(os.getenv("STRUCTURE_SUGGEST_DOC_LIMIT", "64"))
 # Calibrated from UKSI (~15 pages / ~27k chars → ~524 capacity) → ~50k chars ≈ 1000 rows.
@@ -325,21 +328,60 @@ def load_source_documents(
 def _estimate_page_count(documents: list[SourceDocument]) -> int | None:
     if not documents:
         return None
+    meta_pages = 0
+    meta_found = False
     form_pages = 0
     for document in documents:
+        raw_pages = document.metadata.get("page_count") if document.metadata else None
+        if isinstance(raw_pages, int) and raw_pages > 0:
+            meta_pages += raw_pages
+            meta_found = True
+            continue
         text = document.text or ""
         if "\f" in text:
             form_pages += max(1, text.count("\f") + 1)
+    if meta_found:
+        return meta_pages
     if form_pages:
         return form_pages
-    chars = sum(len(doc.text or "") for doc in documents)
+    chars = _total_chars(documents)
     if chars <= 0:
         return None
     return max(1, round(chars / 1800))
 
 
+def _document_capacity_chars(document: SourceDocument) -> int:
+    """Prefer full-corpus estimate (e.g. OCR skim extrapolated) over sampled text length."""
+    raw = document.metadata.get("capacity_chars") if document.metadata else None
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    if isinstance(raw, float) and raw > 0:
+        return int(raw)
+    return len(document.text or "")
+
+
 def _total_chars(documents: list[SourceDocument]) -> int:
-    return sum(len(doc.text or "") for doc in documents)
+    return sum(_document_capacity_chars(doc) for doc in documents)
+
+
+def _select_analysis_documents(
+    documents: list[SourceDocument],
+    *,
+    max_docs: int = PROFILE_SAMPLE_DOCS,
+    seed: int = 42,
+) -> list[SourceDocument]:
+    """Randomly sample stronger docs for profile/persona inference (not just corpus prefix)."""
+    if not documents:
+        return []
+    if len(documents) <= max_docs:
+        return list(documents)
+    rng = random.Random(seed)
+    ranked = sorted(documents, key=lambda doc: _document_capacity_chars(doc), reverse=True)
+    # Sample from the longer half so tiny front-matter-only leftovers are less likely.
+    pool = ranked[: max(max_docs, (len(ranked) + 1) // 2)]
+    if len(pool) <= max_docs:
+        return pool
+    return rng.sample(pool, max_docs)
 
 
 def _detect_ready_instruct(
@@ -588,7 +630,7 @@ def suggest_structure_for_sources(
             if total_chars < MIN_STRUCTURE_CHARS:
                 raise StructureSourceTooSmallError(SOURCE_TOO_SMALL_MESSAGE)
 
-            analysis = documents[: min(2, len(documents))]
+            analysis = _select_analysis_documents(documents, max_docs=PROFILE_SAMPLE_DOCS, seed=42)
             engine = backend or build_default_backend(
                 config.model,
                 max_input_tokens=config.max_input_tokens,
@@ -612,7 +654,7 @@ def suggest_structure_for_sources(
                 logger.info("suggest: fast profile ok extras={}", len(extras))
             except Exception as exc:
                 logger.warning("suggest: fast profile failed ({}), falling back", type(exc).__name__)
-                profile = infer_dataset_profile(engine, analysis, sample_docs=1)
+                profile = infer_dataset_profile(engine, analysis, sample_docs=PROFILE_SAMPLE_DOCS)
                 extras = []
                 try:
                     extras = infer_personas_from_profile(
@@ -660,16 +702,21 @@ def suggest_structure_for_sources(
                     pool_sizes[name] = pool_sizes.get(name, 0) + size
                 del tree
 
-            analysis_chars = max(1, _total_chars(analysis))
+            analysis_chars = max(1, sum(len(doc.text or "") for doc in analysis))
+            # total_chars uses capacity_chars (OCR skim extrapolated to full PDFs).
+            # Scale sample capacity by actual analysis text → full corpus chars.
             extrapolated = int(sample_capacity * (total_chars / analysis_chars))
             char_floor = _estimate_capacity_from_chars(total_chars, n_personas=len(personas))
             capacity = max(extrapolated, char_floor, sample_capacity)
             logger.info(
-                "suggest: capacity sample={} extrapolated={} char_floor={} final={}",
+                "suggest: capacity sample={} extrapolated={} char_floor={} final={} "
+                "analysis_text_chars={} corpus_capacity_chars={}",
                 sample_capacity,
                 extrapolated,
                 char_floor,
                 capacity,
+                analysis_chars,
+                total_chars,
             )
 
             if capacity < MIN_STRUCTURE_ROWS:
@@ -792,8 +839,10 @@ def run_structure_job(
 
     (output_dir / "source_schema.json").write_text(json.dumps(schema.to_dict(), indent=2) + "\n")
 
-    # Brief skim only — do not sample dozens of docs for profile/persona setup.
-    analysis_documents = documents[: max(1, min(len(documents), 2))]
+    # Random interior-doc sample for profile/persona setup (avoid front-matter bias).
+    analysis_documents = _select_analysis_documents(
+        documents, max_docs=PROFILE_SAMPLE_DOCS, seed=config.seed
+    )
     engine = backend or build_default_backend(
         config.model,
         max_input_tokens=config.max_input_tokens,
@@ -821,7 +870,9 @@ def run_structure_job(
             )
         except Exception as exc:
             logger.warning("generate: fast profile failed ({}), falling back", type(exc).__name__)
-            dataset_profile = infer_dataset_profile(engine, analysis_documents, sample_docs=1)
+            dataset_profile = infer_dataset_profile(
+                engine, analysis_documents, sample_docs=PROFILE_SAMPLE_DOCS
+            )
             personas = resolve_job_personas(
                 engine,
                 analysis_documents,
@@ -830,7 +881,9 @@ def run_structure_job(
             )
     else:
         logger.info("generate: resolving requested personas={}", config.personas)
-        dataset_profile = infer_dataset_profile(engine, analysis_documents, sample_docs=1)
+        dataset_profile = infer_dataset_profile(
+            engine, analysis_documents, sample_docs=PROFILE_SAMPLE_DOCS
+        )
         personas = resolve_job_personas(
             engine,
             analysis_documents,

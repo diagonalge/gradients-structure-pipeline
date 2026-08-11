@@ -25,7 +25,7 @@ from .models import (
     SampledChunk,
     SourceDocument,
 )
-from .parsing import parse_document, split_sentences
+from .parsing import parse_document, split_sentences, is_non_content_heading, is_non_content_text
 from .references import (
     extract_reference_mentions,
     format_output_with_reference_context,
@@ -548,22 +548,61 @@ def _persona_excerpts(documents: list[SourceDocument], max_chars: int = 700) -> 
 def _brief_skim_excerpts(
     documents: list[SourceDocument],
     *,
-    max_docs: int = 1,
-    max_chars: int = 1_200,
+    max_docs: int = 4,
+    max_chars: int = 3_600,
+    pages_per_doc: int = 6,
+    seed: int = 42,
 ) -> list[dict[str, str]]:
-    """Head / middle / tail skim so suggest only briefly reviews the source."""
+    """Random interior page skims for profile/persona inference (avoid front-matter bias)."""
+    if not documents:
+        return []
+    rng = random.Random(seed)
+    # Prefer longer docs, then randomly sample among the stronger half.
+    ranked = sorted(documents, key=lambda doc: len(doc.text or ""), reverse=True)
+    pool = ranked[: max(max_docs, min(len(ranked), max_docs * 2))]
+    if len(pool) > max_docs:
+        chosen_docs = rng.sample(pool, max_docs)
+    else:
+        chosen_docs = list(pool)
+
     out: list[dict[str, str]] = []
-    for document in documents[: max(1, max_docs)]:
-        text = re.sub(r"\s+", " ", (document.text or "")).strip()
-        if not text:
+    per_doc_budget = max(400, max_chars // max(1, len(chosen_docs)))
+
+    for document in chosen_docs:
+        raw = (document.text or "").strip()
+        if not raw:
             continue
-        if len(text) <= max_chars:
-            excerpt = text
-        else:
-            third = max(120, max_chars // 3)
-            mid = max(0, (len(text) // 2) - (third // 2))
-            excerpt = f"{text[:third]} … {text[mid : mid + third]} … {text[-third:]}"
-        out.append({"title": document.title, "excerpt": excerpt})
+        pages = [part.strip() for part in raw.split("\f") if part.strip()]
+        if len(pages) <= 1:
+            window = max(800, min(2_000, per_doc_budget // 2))
+            chunks = [
+                raw[i : i + window] for i in range(0, len(raw), window) if raw[i : i + window].strip()
+            ]
+            pages = chunks or [raw]
+        body = [p for p in pages if not is_non_content_text(p)]
+        if len(body) < max(2, pages_per_doc // 2):
+            body = pages
+        skip = min(max(1, len(body) // 10), max(0, len(body) - 1))
+        interior = body[skip:] or body
+        k = min(pages_per_doc, len(interior))
+        sampled = rng.sample(interior, k) if k < len(interior) else list(interior)
+        order = {id(p): i for i, p in enumerate(pages)}
+        sampled.sort(key=lambda p: order.get(id(p), 0))
+        pieces: list[str] = []
+        used = 0
+        for page in sampled:
+            cleaned = re.sub(r"\s+", " ", page).strip()
+            if not cleaned or is_non_content_text(cleaned):
+                continue
+            room = per_doc_budget - used
+            if room <= 0:
+                break
+            take = cleaned[: min(len(cleaned), max(180, room))]
+            pieces.append(take)
+            used += len(take) + 1
+        if not pieces:
+            continue
+        out.append({"title": document.title, "excerpt": " … ".join(pieces)})
     return out
 
 
@@ -576,12 +615,20 @@ def infer_profile_and_extra_personas_fast(
     """One brief-skim LLM call: dataset profile + up to ``max_inferred`` DS personas."""
     if not documents:
         raise ValueError("At least one document is required")
-    skim = _brief_skim_excerpts(documents, max_docs=1, max_chars=1_200)
+    skim = _brief_skim_excerpts(documents, max_docs=4, max_chars=3_600, pages_per_doc=6)
     if not skim:
         raise ValueError("Document skim is empty")
-    prompt = f"""Briefly skim the source excerpts (head/middle/tail only) and return:
-1) a compact dataset profile
+    prompt = f"""Briefly skim the source excerpts and return:
+1) a compact dataset profile for the SUBSTANTIVE body content
 2) exactly {max_inferred} domain-specific personas
+
+Critical sampling notes:
+- Excerpts are random interior pages. IGNORE publisher/front-matter boilerplate even if remnants appear
+  (ProQuest banners, copyright notices, approval sheets, candidate information, tables of contents,
+  Creative Commons legalese, "Information to All Users").
+- Profile the actual research/domain content (methods, findings, entities, procedures in the body).
+- preferred_task_types must reflect that body content — never invent thesis-submission / approval-workflow
+  / formatting-guideline tasks unless the corpus is genuinely about institutional submission policy.
 
 Do NOT include line-analyst, summarizer, needle, or detail-researcher — those are already added.
 Keep preferred_task_types to 4 short abstract labels (diverse cognitive moves).
@@ -597,7 +644,8 @@ Return only JSON:
   "preferred_task_types": ["task1", "task2", "task3", "task4"],
   "instruction_guidance": "standalone named-subject rules; no example stems",
   "answer_guidance": "concise factual answers across the task types",
-  "avoid": ["repeating the same task type or instruction stem across rows"],
+  "avoid": ["repeating the same task type or instruction stem across rows",
+            "front-matter, copyright, or submission-admin tasks"],
   "recommended_chunk_level": "document|section|paragraph|line|needle|page",
   "personas": [
     {{"name": "short-kebab-name", "description": "who they are and their goal",
@@ -621,14 +669,15 @@ def infer_dataset_profile(
     backend: InferenceBackend,
     documents: list[SourceDocument],
     *,
-    sample_docs: int = 1,
+    sample_docs: int = 4,
 ) -> DatasetProfile:
     if not documents:
         raise ValueError("At least one document is required to infer a dataset profile")
-    sample = documents[: max(1, min(sample_docs, len(documents)))]
     prompt = f"""Identify this dataset and decide what supervised instruction data should extract from it.
-Use only a brief skim of the samples (do not assume you read the whole corpus).
-Do not invent a domain that is unsupported by the samples.
+Use only a brief skim of random interior pages (do not assume you read the whole corpus).
+IGNORE publisher front matter (ProQuest, copyright, approval sheets, TOC, Creative Commons legalese).
+Do not invent a domain that is unsupported by the body-content samples.
+Do NOT profile the corpus as thesis-submission / approval-workflow admin unless that is truly the topic.
 Focus on modalities that make the eventual instruction/output pairs faithful to the source.
 
 Diversity requirements (critical):
@@ -644,6 +693,7 @@ Diversity requirements (critical):
 - answer_guidance should allow concise factual answers, short lists, and brief explanations — not only
   "recommend treatment" style responses.
 - Put "repeating the same task type or instruction stem across rows" in avoid.
+- Also avoid front-matter / copyright / submission-admin tasks.
 
 Examples of modality adaptation (balanced — do not reduce a domain to one bullet):
 - Math textbooks: formulas, identities, theorem statements, proof steps, worked calculations.
@@ -651,6 +701,7 @@ Examples of modality adaptation (balanced — do not reduce a domain to one bull
 - Clinical / medical handbooks: findings, diagnostic criteria, differentials, mechanisms, treatments,
   contraindications, complications — treat these as co-equal.
 - Code or API docs: signatures, failure modes, edge cases, repair steps, invariants.
+- Research papers / dissertations: methods, experimental setups, results, claims, definitions, comparisons.
 
 Return only:
 {{
@@ -661,12 +712,13 @@ Return only:
   "preferred_task_types": ["task1", "task2", "task3", "task4"],
   "instruction_guidance": "abstract phrasing rules only; no example questions",
   "answer_guidance": "how answers should be phrased across the diverse task types",
-  "avoid": ["repeating the same task type or instruction stem across rows", "..."],
+  "avoid": ["repeating the same task type or instruction stem across rows",
+            "front-matter, copyright, or submission-admin tasks"],
   "recommended_chunk_level": "document|section|paragraph|line|needle|page"
 }}
 
 Sample skim:
-{json.dumps(_brief_skim_excerpts(sample, max_docs=len(sample), max_chars=900), ensure_ascii=False)}
+{json.dumps(_brief_skim_excerpts(documents, max_docs=sample_docs, max_chars=3_600, pages_per_doc=6), ensure_ascii=False)}
 """
     value = _retry_json(backend, _PROFILE_SYSTEM, prompt, max_new_tokens=900, attempts=3)
     if not isinstance(value, dict):
@@ -1031,6 +1083,8 @@ def is_high_value_chunk(text: str, *, minimum_chars: int = 80) -> bool:
     value = text.strip()
     if len(value) < minimum_chars:
         return False
+    if is_non_content_text(value):
+        return False
     if is_prompt_only_chunk(value):
         return False
     if _LOW_VALUE_CHUNK_RE.search(value):
@@ -1052,13 +1106,21 @@ def is_high_value_chunk(text: str, *, minimum_chars: int = 80) -> bool:
 
 
 def _candidate_sections(tree: DocumentTree) -> list:
-    sections = [section for section in tree.sections if is_high_value_chunk(section.text, minimum_chars=160)]
+    sections = [
+        section
+        for section in tree.sections
+        if not is_non_content_heading(section.title)
+        and is_high_value_chunk(section.text, minimum_chars=160)
+    ]
     if sections:
         return sections
     return [
         section
         for section in tree.sections
-        if len(section.text) >= 160 and not is_prompt_only_chunk(section.text)
+        if not is_non_content_heading(section.title)
+        and len(section.text) >= 160
+        and not is_prompt_only_chunk(section.text)
+        and not is_non_content_text(section.text, heading=section.title)
     ]
 
 
@@ -1086,6 +1148,8 @@ def _candidate_pages(tree: DocumentTree) -> list[tuple[str, str, int]]:
     results: list[tuple[str, str, int]] = []
     search_from = 0
     for index, page in enumerate(raw_pages, start=1):
+        if is_non_content_text(page):
+            continue
         if not is_high_value_chunk(page, minimum_chars=80) and not (
             len(page) >= 80 and not is_prompt_only_chunk(page)
         ):
@@ -1839,7 +1903,7 @@ def generate_grounded_pair(
         ordered = list(pool)
 
     for attempt_i, chunk in enumerate(ordered[:max_attempts]):
-        if is_prompt_only_chunk(chunk.text):
+        if is_prompt_only_chunk(chunk.text) or is_non_content_text(chunk.text, heading=chunk.section_path):
             last_error = ValueError("Sampled chunk is prompt-only without answerable source material")
             continue
         header = f"{header_prefix}{chunk.section_path}\nDocument summary: {summary}"
